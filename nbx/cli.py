@@ -95,6 +95,15 @@ def main(argv=None):
     pqu.add_argument("--my-id", default="nbx_id.key")
     pqu.add_argument("--from-pub", required=True)
 
+    rl = sub.add_parser("relay", help="启动中继服务器（密文搬运工）")
+    rl.add_argument("--port", type=int, default=8765)
+
+    ch = sub.add_parser("chat", help="经中继的加密会话客户端")
+    ch.add_argument("--relay", default="http://127.0.0.1:8765")
+    ch.add_argument("--my-id", required=True)
+    ch.add_argument("--to-pub", required=True, help="对方身份公钥（Base64）")
+    ch.add_argument("--poll", type=float, default=2.0, help="取信轮询秒数")
+
     args = p.parse_args(argv)
 
     if args.cmd == "keygen":
@@ -288,6 +297,23 @@ def main(argv=None):
 
     elif args.cmd == "listen":
         transfer.listen(args.port, args.outdir, args.keyfile)
+
+    elif args.cmd == "relay":
+        from .relay import RelayLogic, MemoryStore, RelayServer
+        logic = RelayLogic(MemoryStore())
+        srv = RelayServer(logic, port=args.port)
+        print(f"[nbx relay] listening on 127.0.0.1:{args.port} (Ctrl+C to stop)")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[nbx relay] stopped")
+
+    elif args.cmd == "chat":
+        from .chat import run_chat
+        from .fskey import Identity
+        ident = Identity.load(args.my_id)
+        run_chat(ident, args.to_pub, args.relay, speaks_first=False,
+                 poll=args.poll)
 
 
 def _read_key(path: str) -> bytes:
