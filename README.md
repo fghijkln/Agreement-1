@@ -60,7 +60,7 @@ python -m nbx.cli anon pack secret.nbx secret.aw --keyfile my.key --pad 4096
 python -m nbx.cli anon unpack secret.aw secret.nbx --keyfile my.key
 ```
 
-`--pad 4096` 把长度补齐到 4 KiB 倍数（随机字节填充）。1000 字节和 3000 字节的内层产生相同的 4136 字节外层，长度不可区分。外层搜不到 NBX 魔数和任何元数据。
+`--pad 4096` 在加密前把明文预填充到 4 KiB 倍数（随机字节，填充随密文一起加密）。1000 字节和 3000 字节的内层产生相同的 4096 字节外层，长度不可区分；解密单次 AEAD 完成。外层搜不到 NBX 魔数和任何元数据。
 
 ## 代码结构
 

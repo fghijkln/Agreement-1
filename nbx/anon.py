@@ -42,30 +42,28 @@ def _wrap_key(master_key: bytes, salt: bytes) -> bytes:
 def wrap(inner: bytes, master_key: bytes, pad_block: int = 0) -> bytes:
     """把任意内层容器（通常为完整 .nbx）包成匿名外层。
 
-    pad_block > 0 时, 外层总长向上取整到该倍数。真实长度前缀加密进密文内,
-    外层观察者（无密钥）无法区分补齐前的大小。
+    pad_block > 0 时把明文（长度前缀 + inner）预填充到使外层总长
+    恰为 pad_block 的整数倍，ct 本身对齐——unwrap 单次 AEAD 解密即可，
+    无需猜测填充长度。外层观察者（无密钥）无法区分补齐前的大小。
     """
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(12)
     key = _wrap_key(master_key, salt)
-    # 真实长度前缀放在被加密的明文里，外层不可见
-    plaintext = struct.pack("<I", len(inner)) + inner
-    ct = ChaCha20Poly1305(key).encrypt(nonce, plaintext, None)
-    flags = 0
+    flags = 1 if pad_block > 0 else 0
     if pad_block > 0:
-        body = 12 + len(ct)  # nonce 已在 ct 外计? 不: ct 含 AEAD tag
-        # 外层总长 = HEADER(12) + salt(16) + nonce(12) + ct(len+tag)
-        total_body = 16 + 12 + len(ct)
-        target = ((HEADER.size + total_body + pad_block - 1) // pad_block) * pad_block
-        pad = target - HEADER.size - total_body
-        flags = 1
+        # 外层总长 = HEADER(12) + salt(16) + nonce(12) + len(plain) + tag(16)
+        overhead = HEADER.size + 16 + 12 + 16
+        body = len(inner) + 4
+        target_body = ((overhead + body + pad_block - 1) // pad_block) * pad_block - overhead
+        plaintext = struct.pack("<I", len(inner)) + inner + secrets.token_bytes(target_body - body)
     else:
-        pad = 0
-    return HEADER.pack(MAGIC_AW, flags, pad_block) + salt + nonce + ct + secrets.token_bytes(pad)
+        plaintext = struct.pack("<I", len(inner)) + inner
+    ct = ChaCha20Poly1305(key).encrypt(nonce, plaintext, None)
+    return HEADER.pack(MAGIC_AW, flags, pad_block) + salt + nonce + ct
 
 
 def unwrap(blob: bytes, master_key: bytes) -> bytes:
-    """解开匿名外层, 返回内层原始容器。"""
+    """解开匿名外层, 返回内层原始容器。单次 AEAD 解密。"""
     if len(blob) < HEADER.size + 16 + 12 + 4 + 16:
         raise AnonymityError("too short to be an AW blob")
     magic, flags, pad_block = HEADER.unpack_from(blob, 0)
@@ -75,26 +73,6 @@ def unwrap(blob: bytes, master_key: bytes) -> bytes:
     salt = blob[off:off + 16]; off += 16
     nonce = blob[off:off + 12]; off += 12
     ct = blob[off:]
-    if flags & 1 and pad_block:
-        # 尾部填充是随机字节：AEAD 解密会自动忽略吗？不会，填充在 ct 之外。
-        # 但我们不知道 pad 的确切长度（这正是设计目标），所以尝试逐步裁剪直到解密成功。
-        # 更快：外层总长已对齐 pad_block，pad 长度 = 总长 - HEADER - 16 - 12 - ct_real。
-        # ct_real 未知，但必然满足 (HEADER+16+12+ct_real+pad) % pad_block == 0。
-        # 逐个候选 pad 长度（0..pad_block-1 步长）尝试最坏 pad_block 次；实际只用试
-        # 使剩余长度合法的那几个。这里做有界尝试。
-        key = _wrap_key(master_key, salt)
-        # pad 长度在 [0, pad_block) 内且外层已对齐，最多试 pad_block 次
-        for cut in range(0, min(pad_block, len(ct) - 16) + 1):
-            trial = ct[:len(ct) - cut] if cut else ct
-            try:
-                plain = ChaCha20Poly1305(key).decrypt(nonce, trial, None)
-            except Exception:
-                continue
-            (real_len,) = struct.unpack_from("<I", plain, 0)
-            if 4 + real_len == len(plain):
-                return plain[4:]
-            # AEAD 通过但长度不符：继续
-        raise AnonymityError("padding recovery failed: no valid ciphertext length")
     key = _wrap_key(master_key, salt)
     plain = ChaCha20Poly1305(key).decrypt(nonce, ct, None)
     (real_len,) = struct.unpack_from("<I", plain, 0)
