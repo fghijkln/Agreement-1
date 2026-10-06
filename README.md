@@ -112,7 +112,7 @@ tor onion service 指向任意上述实例             # 匿名部署，地址�
 ```
 应用层 → TransportStack.send(联系人, 消息)
   L1  P2P 直连     局域网/打洞后的直连（最低延迟）
-  L2  匿名网络     Tor/I2P 上的中继（无公网 IP 也可收发，IP 不可关联）
+  L2  匿名网络     Tor/I2P 上的中继（无公网 IP 也可收发，IP 不可关联）— 已实测
   L3  中继服务器   自建或 Workers（保底，永远可达）
 ```
 

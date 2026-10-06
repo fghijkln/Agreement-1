@@ -435,7 +435,9 @@ skipped entry: ratchet_pub(32) || msg_no(4, LE) || message_key(32)
 ```
 应用层 → TransportStack.send(fp, blob)
   L1 P2P 直连    TCP 直连对端 mini-relay（同 relay 协议）；UDP 打洞在 M2.5c
-  L2 匿名网络    SOCKS5（Tor 9050）→ onion:port 上的 relay 协议；I2P 同构
+  L2 匿名网络    SOCKS5（Tor 9050，手写握手 05 01 00 / CONNECT domain 0x03）
+                 → onion:port 上的 relay 协议；I2P 同构
+                 已实测: Alice → SOCKS5 → onion → relay → Bob 取信 ≈1.6s
   L3 中继        relay HTTP（9.3），首次自动 /auth
 按 pref 顺序逐层逐地址尝试，成功即返回 (layer, result) 并记录；全部失败返回 -1。
 poll() 反向：从所有标记 last_ok 的地址取自己的桶。
