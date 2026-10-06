@@ -21,6 +21,7 @@ const MAX_PER_FP = 256;                  // 每指纹队列上限
 const MAX_ENVELOPE = 1 << 20;            // 单信封 1 MiB
 const AUTH_SKEW_S = 300;                 // 时间窗 ±300s
 const AUTH_INFO = "nbx-relay-auth-v1";
+const DELIVERY_INFO = "nbx-relay-delivery-v2";   // R2-02: 投递签名域分隔
 
 function b64urlEncode(buf: ArrayBuffer | Uint8Array): string {
   const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
@@ -137,13 +138,30 @@ export default {
         });
         if (!regResp.ok) return json(429, { ok: false, error: "registration quota exhausted" });
       }
+      // audit R2-01: 中继身份证明 —— 向 RegistryDo（单例，持有中继签名密钥）
+      // 请求对 (client_fp, ts) 的签名，随 relay_pub 一并返回。客户端
+      // TOFU-pin relay_pub 后可密码学认证"对面确实是这台中继"。
+      let relayPubB64 = "", relaySigB64 = "";
+      {
+        const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
+        const idResp = await regStub.fetch("https://registry/relay_sign", {
+          method: "POST",
+          body: concat(fp, tsBytes.slice(0)) as BodyInit,
+        });
+        if (idResp.ok) {
+          const idObj = await idResp.json() as { relay_pub: string; relay_sig: string };
+          relayPubB64 = idObj.relay_pub;
+          relaySigB64 = idObj.relay_sig;
+        }
+      }
       const id = env.NBX_FP.idFromName(b64urlEncode(fp));
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pubkey", {
         method: "PUT", body: edPub as BodyInit,
       });
       if (resp.status === 409) return json(409, { ok: false, error: "fingerprint already bound to another key" });
-      return json(200, { ok: true, fp: b64urlEncode(fp) });
+      return json(200, { ok: true, fp: b64urlEncode(fp),
+                         relay_pub: relayPubB64, relay_sig: relaySigB64 });
     }
 
     if (req.method === "POST" && url.pathname === "/envelope") {
@@ -159,7 +177,9 @@ export default {
       if (hdr.ptype === 0) return json(400, { ok: false, error: "invalid ptype" });
       if (b64urlEncode(hdr.senderFp) === b64urlEncode(hdr.recvFp))
         return json(400, { ok: false, error: "self-addressed" });
-      // R-06: 验证发送者签名（发送者须已 AUTH 登记）
+      // R-06 + R2-02: 验证发送者签名（发送者须已 AUTH 登记）。
+      // R2-02: 签名绑定完整信封 SHA256(头+密文) —— 只签 header 时可被
+      // 拿合法 proof 换掉密文再投（绕过去重 + 毁掉合法消息）。
       {
         const senderFpB64 = b64urlEncode(hdr.senderFp);
         const senderId = env.NBX_FP.idFromName(senderFpB64);
@@ -174,8 +194,9 @@ export default {
         const nowS = BigInt(Math.floor(Date.now() / 1000));
         if (ts > nowS + BigInt(AUTH_SKEW_S) || ts < nowS - BigInt(AUTH_SKEW_S))
           return json(403, { ok: false, error: "sender proof timestamp out of window" });
-        const msgBytes = concat(new TextEncoder().encode(AUTH_INFO),
-          body.slice(0, 48), tsBytes);
+        const envDigest = new Uint8Array(
+          await crypto.subtle.digest("SHA-256", body.slice(0, envLen) as BufferSource));
+        const msgBytes = concat(new TextEncoder().encode(DELIVERY_INFO), envDigest, tsBytes);
         if (!await ed25519Verify(senderEd, sigBytes, msgBytes))
           return json(403, { ok: false, error: "bad sender proof" });
         // audit R-10: per-sender 投递配额 —— 认证发送者也不能高频灌信封

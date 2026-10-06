@@ -58,7 +58,12 @@ def _b64e(b: bytes) -> str:
 
 
 def _b64d(s: str) -> bytes:
-    return base64.b64decode(s)
+    """服务器响应使用 urlsafe-b64（无 padding）；本地兼容两种变体。"""
+    pad = "=" * (-len(s) % 4)
+    try:
+        return base64.urlsafe_b64decode(s + pad)
+    except Exception:
+        return base64.b64decode(s + pad)
 
 
 class Contact:
@@ -167,6 +172,7 @@ class TransportStack:
         #  - L3 中继: AUTH 登记成功（服务器返回其按公钥算出的 fp 且校验一致）
         #  - L1/L2: mini-relay 地址须在 challenge 应答验证通过后加入 verified
         self._verified_endpoints: set[str] = set()
+        self._relay_pins: dict[str, bytes] = {}   # audit R2-01: base -> pinned relay_pub
 
     # ---- 各层实现 ----
 
@@ -224,11 +230,11 @@ class TransportStack:
             return TransportResult(LAYER_RELAY, False, str(e))
 
     def _delivery_proof(self, blob: bytes) -> bytes:
-        """信封投递签名（audit R-06）：中继拒收未认证投递。"""
-        import struct as _s
+        """信封投递签名（audit R-06 / R2-02）：签名绑定完整信封（含密文）。"""
+        import hashlib, struct as _s
         ts = _s.pack("<Q", int(time.time()))
-        hdr = blob[:msg.HEADER_SIZE]
-        return ts + self.me.ed_priv.sign(b"nbx-relay-auth-v1" + hdr + ts)
+        digest = hashlib.sha256(blob).digest()
+        return ts + self.me.ed_priv.sign(b"nbx-relay-delivery-v2" + digest + ts)
 
     def _relay_auth(self, base: str):
         """TOFU 登记本方公钥（audit R-03：发送 64B 公钥材料，fp 由服务器算）。"""
@@ -244,15 +250,42 @@ class TransportStack:
         status, resp = self._http_post(base + "/auth", pub_material + ts + sig, None)
         if status != 200:
             raise ConnectionError(f"relay auth failed: HTTP {status}")
-        # audit R-03/14: 服务器返回它按公钥算出的 fp；与本方一致才算认证通过
+        # audit R2-01: 严格校验。此前 `if srv_fp and srv_fp != my_fp` 在
+        # 服务器不回 fp 时静默放行（空 fp = 认证"成功"）；且 fp 是自报的，
+        # 恶意 endpoint 可回 {"fp": <我的fp>} 骗取 verified 身份并拿到 proof。
+        # 现在：空 fp 拒绝 + 中继身份签名验证（TOFU pin relay_pub）。
         try:
             srv = json.loads(resp)
-            srv_fp = _b64d(srv["fp"]) if isinstance(srv, dict) and "fp" in srv else b""
         except Exception:
-            srv_fp = b""
-        if srv_fp and srv_fp != self.my_fp:
+            raise ConnectionError("relay auth: bad response")
+        if not isinstance(srv, dict) or not srv.get("ok"):
+            raise ConnectionError(f"relay auth failed: {srv}")
+        srv_fp = _b64d(srv.get("fp", ""))
+        if not srv_fp:
+            raise ConnectionError("relay auth: server did not return fp")
+        if srv_fp != self.my_fp:
             raise ConnectionError(
                 f"relay fp mismatch: local={self.my_fp.hex()} relay={srv_fp.hex()}")
+        relay_pub_b64, relay_sig_b64 = srv.get("relay_pub", ""), srv.get("relay_sig", "")
+        if not relay_pub_b64 or not relay_sig_b64:
+            raise ConnectionError("relay auth: missing relay identity proof")
+        relay_pub = _b64d(relay_pub_b64)
+        relay_sig = _b64d(relay_sig_b64)
+        if len(relay_pub) != 32 or len(relay_sig) != 64:
+            raise ConnectionError("relay auth: malformed relay identity proof")
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(relay_pub).verify(
+                relay_sig, b"nbx-relay-server-auth-v1" + self.my_fp + relay_pub + ts)
+        except Exception:
+            raise ConnectionError("relay auth: bad relay signature")
+        # TOFU pin: 首见即固定，此后变化视为 MITM
+        prev = self._relay_pins.get(base)
+        if prev is None:
+            self._relay_pins[base] = relay_pub
+        elif prev != relay_pub:
+            raise ConnectionError(
+                f"relay identity changed (possible MITM) at {base}")
         self._relay_authed.add(base)
         self._verified_endpoints.add(base)   # R-16: 认证成功 ≠ 仅 HTTP 可达
 

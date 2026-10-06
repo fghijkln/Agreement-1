@@ -73,7 +73,7 @@ class ContactSession:
         wire = msg.pack_message(msg.PT_HANDSHAKE, self.daemon.my_fp,
                                 self.peer_fp, payload)
         self.daemon.client.post_envelope(
-            wire, delivery_proof(self.daemon.identity, wire[:msg.HEADER_SIZE]))
+            wire, delivery_proof(self.daemon.identity, wire))
         self.daemon.log_event(f"握手已发 → {self.peer_fp.hex()}")
 
     def finish_handshake(self, peer_hs: bytes) -> None:
@@ -92,8 +92,7 @@ class ContactSession:
             wire = msg.pack_message(msg.PT_HANDSHAKE, self.daemon.my_fp,
                                     self.peer_fp, payload)
             self.daemon.client.post_envelope(
-                wire, delivery_proof(self.daemon.identity,
-                                     wire[:msg.HEADER_SIZE]))
+                wire, delivery_proof(self.daemon.identity, wire))
         hs.finish(self.daemon.identity, self.daemon._peer_ed_pub(self.peer_pub),
                   peer_hs, speaks_first=self.daemon.speaks_first_for(self.peer_pub),
                   expect_sender_fp=self.peer_fp,
@@ -123,7 +122,7 @@ class ContactSession:
                                         msg.PT_TEXT, self.daemon.my_fp,
                                         self.peer_fp)))
         self.daemon.client.post_envelope(
-            wire, delivery_proof(self.daemon.identity, wire[:msg.HEADER_SIZE]))
+            wire, delivery_proof(self.daemon.identity, wire))
         self.daemon.log_message("out", self.peer_fp, text)
         self.daemon.save_session(self)          # 每条消息后立即持久化（ratchet 前跳）
         return {"queued": False}

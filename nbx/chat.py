@@ -88,15 +88,21 @@ def raw_public(identity: Identity) -> bytes:
     return x_pub + ed_pub
 
 
-def delivery_proof(sender_identity, header: bytes) -> bytes:
-    """信封投递签名（audit R-06）：ts(8) + Ed25519_sign(AUTH_INFO||header||ts)。
+DELIVERY_INFO = b"nbx-relay-delivery-v2"
 
-    追加在信封末尾；中继用 AUTH 登记的发送者公钥验证。未认证投递
-    被拒——封堵"匿名灌满收件桶挤掉合法消息"。
+
+def delivery_proof(sender_identity, envelope: bytes) -> bytes:
+    """信封投递签名（audit R-06 / R2-02）：ts(8) + Ed25519_sign。
+
+    sig = Ed25519_sign(DELIVERY_INFO || SHA256(envelope) || ts)。
+    R2-02: 签名绑定**完整信封**（明文头 + 密文体）——只签 header 时
+    攻击者可拿合法 proof 换掉密文再投（绕过 msg_id 去重、毁掉合法消息）。
+    域分隔 DELIVERY_INFO 与 /auth、/inbox proof 的 AUTH_INFO 隔离。
     """
-    import struct as _s
+    import hashlib, struct as _s
     ts = _s.pack("<Q", int(time.time()))
-    return ts + sender_identity.ed_priv.sign(AUTH_INFO + header + ts)
+    digest = hashlib.sha256(envelope).digest()
+    return ts + sender_identity.ed_priv.sign(DELIVERY_INFO + digest + ts)
 
 
 def auth_proof(identity: Identity, fp: bytes) -> bytes:
@@ -104,11 +110,28 @@ def auth_proof(identity: Identity, fp: bytes) -> bytes:
     return ts + identity.ed_priv.sign(AUTH_INFO + fp + ts)
 
 
-class RelayClient:
-    """中继 HTTP 客户端。"""
+RELAY_AUTH_INFO = b"nbx-relay-server-auth-v1"
 
-    def __init__(self, base: str):
+
+class RelayClient:
+    """中继 HTTP 客户端。
+
+    audit R2-01: 中继身份为密码学认证而非自证——AUTH 响应附
+    relay_pub + 中继对 (RELAY_AUTH_INFO||client_fp||relay_pub||ts) 的签名。
+    首次见到 relay_pub 时 TOFU-pin（可持久化到 pin 文件）；此后
+    relay_pub 变化即视为中间人攻击立即报错。空 fp / 无签名 / 验签
+    失败一律拒绝——不再有 `if srv_fp and ...` 的放行分支。
+    """
+
+    def __init__(self, base: str, pin_file: str | None = None):
         self.base = base.rstrip("/")
+        self.relay_pinned_pub: bytes | None = None
+        self._pin_file = pin_file
+        if pin_file:
+            import os
+            if os.path.exists(pin_file):
+                with open(pin_file, "rb") as f:
+                    self.relay_pinned_pub = f.read().strip() or None
 
     def post_envelope(self, blob: bytes, proof: bytes | None = None) -> dict:
         # audit R-06：proof = delivery_proof(...)，中继验证发送者签名
@@ -132,11 +155,35 @@ class RelayClient:
             obj = json.loads(r.read())
         if not obj.get("ok"):
             raise PermissionError(f"relay auth failed: {obj}")
-        # 中继认定的 fp 必须与本地一致（钥匙对不上立即报错，而非静默错桶）
-        srv_fp = _b64d(obj.get("fp", ""))
-        if srv_fp and srv_fp != fp:
+        # audit R2-01: 严格校验（不再有空 fp 放行分支）
+        if "fp" not in obj or not obj["fp"]:
+            raise PermissionError("relay auth: missing fp in response")
+        srv_fp = _b64d(obj["fp"])
+        if srv_fp != fp:
             raise PermissionError(
                 f"relay fp mismatch: local={fp.hex()} relay={srv_fp.hex()}")
+        # audit R2-01: 中继身份验证（TOFU pin）
+        if "relay_pub" not in obj or "relay_sig" not in obj:
+            raise PermissionError("relay auth: missing relay identity proof")
+        relay_pub = _b64d(obj["relay_pub"])
+        relay_sig = _b64d(obj["relay_sig"])
+        if len(relay_pub) != 32 or len(relay_sig) != 64:
+            raise PermissionError("relay auth: malformed relay identity proof")
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(relay_pub).verify(
+                relay_sig, RELAY_AUTH_INFO + fp + relay_pub + ts)
+        except Exception:
+            raise PermissionError("relay auth: bad relay signature")
+        if self.relay_pinned_pub is None:
+            self.relay_pinned_pub = relay_pub        # TOFU 首次 pin
+            if self._pin_file:
+                with open(self._pin_file, "wb") as f:
+                    f.write(relay_pub)
+        elif self.relay_pinned_pub != relay_pub:
+            raise PermissionError(
+                "relay identity changed (possible MITM): "
+                f"pinned={self.relay_pinned_pub.hex()} got={relay_pub.hex()}")
 
     def fetch(self, fp: bytes, proof: bytes) -> list[bytes]:
         # 安全（audit R-04）：proof 走 POST body，不进 URL/访问日志
@@ -179,7 +226,7 @@ class ChatSession:
         hs_wire = msg.pack_message(
             msg.PT_HANDSHAKE, self.my_fp, self.peer_fp, payload)
         self.client.post_envelope(
-            hs_wire, delivery_proof(self.identity, hs_wire[:msg.HEADER_SIZE]))
+            hs_wire, delivery_proof(self.identity, hs_wire))
         peer_hs = self._wait_handshake()
         hs.finish(self.identity, self.peer_ed_pub, peer_hs,
                   speaks_first=self.speaks_first,
@@ -230,7 +277,7 @@ class ChatSession:
                 msg.PT_TEXT, self.my_fp, self.peer_fp))
         wire = msg.pack_message(msg.PT_TEXT, self.my_fp, self.peer_fp, inner)
         self.client.post_envelope(
-            wire, delivery_proof(self.identity, wire[:msg.HEADER_SIZE]))
+            wire, delivery_proof(self.identity, wire))
         return wire
 
     def poll_once(self) -> list[tuple[int, str]]:

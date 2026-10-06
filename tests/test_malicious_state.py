@@ -100,7 +100,6 @@ def test_forged_ratchet_pub_then_real_ratchet_still_works():
     """① 补充：垃圾换钥包之后，真换钥消息照常解（审计复现场景）。"""
     a, b = mk_pair()
     a.encrypt(b"m1")
-    assert b.decrypt(a.encrypt.__self__ and b"") if False else True
     # 真实第二轮: A 触发换钥 — 连续加密中 B 回信后 A 才换钥,
     # 简化: 直接伪造后验证 B 状态不变, 再走一轮正常双向
     fake_hdr = (secrets.token_bytes(32) + struct.pack("<II", 0, 0))
@@ -110,7 +109,6 @@ def test_forged_ratchet_pub_then_real_ratchet_still_works():
     assert b.decrypt(a.encrypt(b"m2")) == b"m2"
     back = b.encrypt(b"reply")
     assert a.decrypt(back) == b"reply"
-    assert a.decrypt(a.encrypt.__self__ and b"") if False else True
 
 
 def test_random_garbage_fuzz_state_unchanged():

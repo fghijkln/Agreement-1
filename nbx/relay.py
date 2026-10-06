@@ -40,6 +40,8 @@ MAX_ENVELOPE = 1 << 20           # 单信封 1 MiB（大文件走 FILE_OFFER + �
 DEFAULT_MAX_TOTAL_BYTES = 256 * (1 << 20)   # audit R-07：全局在存字节预算 256 MiB
 
 AUTH_INFO = b"nbx-relay-auth-v1"
+DELIVERY_INFO = b"nbx-relay-delivery-v2"
+RELAY_AUTH_INFO = b"nbx-relay-server-auth-v1"   # audit R2-01: 中继身份签名域
 
 
 def _b64e(b: bytes) -> str:
@@ -127,12 +129,27 @@ class RelayLogic:
     def __init__(self, store: RelayStore,
                  ttl: int = DEFAULT_TTL,
                  max_per_fp: int = DEFAULT_MAX_PER_FP,
-                 max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES):
+                 max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+                 relay_ed_priv=None):
         self.store = store
         self.ttl = ttl
         self.max_per_fp = max_per_fp
         self.max_total_bytes = max_total_bytes   # audit R-07：全局字节预算
         self._pubkeys: dict[bytes, bytes] = {}   # fp -> ed25519 公钥（AUTH 登记）
+        # audit R2-01: 中继自身签名密钥。AUTH 响应附带对
+        # (client_fp, relay_pub, ts) 的签名，客户端 TOFU-pin relay_pub 后
+        # 可密码学认证"对面确实是这台中继"——此前仅回显 fp 属于自证。
+        if relay_ed_priv is None:
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            relay_ed_priv = ed25519.Ed25519PrivateKey.generate()
+        self.relay_ed_priv = relay_ed_priv
+        from cryptography.hazmat.primitives import serialization
+        self.relay_pub = relay_ed_priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+    def relay_attestation(self, client_fp: bytes, ts: bytes) -> bytes:
+        """audit R2-01: 中继对 (RELAY_AUTH_INFO||client_fp||relay_pub||ts) 签名。"""
+        return self.relay_ed_priv.sign(RELAY_AUTH_INFO + client_fp + self.relay_pub + ts)
 
     # ---------- 投递 ----------
 
@@ -146,19 +163,23 @@ class RelayLogic:
         256 条队列，把合法离线消息挤掉（无需知道任何密钥）。
         """
         sender_fp = blob[12:20]
-        if envelope_len < HEADER_SIZE + 72:
+        if envelope_len < HEADER_SIZE or len(blob) < envelope_len + 72:
             raise ValueError("missing sender proof")
-        ts = blob[envelope_len - 72:envelope_len - 64]
-        sig = blob[envelope_len - 64:]
+        ts = blob[envelope_len:envelope_len + 8]
+        sig = blob[envelope_len + 8:envelope_len + 72]
         if abs(time.time() - struct.unpack("<Q", ts)[0]) > now_skew:
             raise ValueError("sender proof timestamp out of window")
         ed_pub = self._pubkeys.get(sender_fp)
         if ed_pub is None:
             raise ValueError("sender not registered (auth first)")
         from cryptography.hazmat.primitives.asymmetric import ed25519
+        import hashlib
         try:
+            # audit R2-02: 验签绑定完整信封（SHA256(头+密文)），防止
+            # 拿合法 proof 换掉密文绕过去重/毁掉合法消息。
+            digest = hashlib.sha256(blob[:envelope_len]).digest()
             ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(
-                sig, AUTH_INFO + blob[:HEADER_SIZE] + ts)
+                sig, DELIVERY_INFO + digest + ts)
         except Exception:
             raise ValueError("bad sender proof")
         return sender_fp
@@ -183,7 +204,7 @@ class RelayLogic:
         if recv_fp == m["sender_fp"]:
             raise ValueError("self-addressed")
         if verify:
-            self.verify_sender(blob, len(blob))
+            self.verify_sender(blob, len(blob) - 72)   # envelope_len 不含 proof 后缀
             blob = blob[:-72]              # 入队存裸信封，收件方无感
         if not self.store.put(recv_fp, blob):
             # 重复信封（msg_id 去重命中）：幂等返回成功但不重复入队
@@ -271,7 +292,12 @@ def make_handler(logic: RelayLogic):
                 fp = logic.register_pubkey(pub_material)
             except ValueError as e:
                 return 409, {"ok": False, "error": str(e)}
-            return 200, {"ok": True, "fp": _b64e(fp)}
+            # audit R2-01: 响应附中继身份证明（relay_pub + 对 client_fp 的签名）。
+            # 客户端 TOFU-pin relay_pub 后可验证"对面确实是这台中继"，
+            # 恶意 endpoint 自报 {"fp": <我的fp>} 不再能骗过认证。
+            return 200, {"ok": True, "fp": _b64e(fp),
+                         "relay_pub": _b64e(logic.relay_pub),
+                         "relay_sig": _b64e(logic.relay_attestation(fp, ts))}
         if method == "POST" and path.startswith("/inbox/"):
             # 安全（audit R-04）：proof 不走 URL query——查询串会进
             # 反代/边缘（Cloudflare）访问日志，5 分钟窗口内可重放。

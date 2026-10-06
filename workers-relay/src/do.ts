@@ -16,6 +16,14 @@ function b64urlEncode(buf: Uint8Array): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+function concat(...arrs: Uint8Array[]): Uint8Array {
+  const total = arrs.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrs) { out.set(a, off); off += a.length; }
+  return out;
+}
+
 function json(status: number, obj: unknown): Response {
   return new Response(JSON.stringify(obj), {
     status,
@@ -130,6 +138,51 @@ export class RegistryDo {
       await this.state.storage.put("count", count + 1);
       return json(200, { ok: true, existing: false });
     }
+    // audit R2-01: 中继身份签名。body = client_fp(8) || ts(8)。
+    // 私钥 seed 首次生成并持久化于本单例 DO；签名覆盖
+    // RELAY_AUTH_INFO || client_fp || relay_pub || ts。
+    if (req.method === "POST" && path === "/relay_sign") {
+      const body = new Uint8Array(await req.arrayBuffer());
+      if (body.length !== 16) return json(400, { ok: false, error: "bad sign payload" });
+      const clientFp = body.slice(0, 8);
+      const ts = body.slice(8, 16);
+      let seed = await this.state.storage.get<Uint8Array>("relay_seed");
+      if (!seed || seed.length !== 32) {
+        // 首次生成：同时存下公钥（WebCrypto 无法从私钥导出公钥）
+        const kp = await crypto.subtle.generateKey(
+          { name: "Ed25519" } as AlgorithmIdentifier, true, ["sign", "verify"]) as CryptoKeyPair;
+        const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey));
+        seed = pkcs8.slice(pkcs8.length - 32);          // 末 32B 即 seed
+        const rawPub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+        await this.state.storage.put("relay_seed", seed);
+        await this.state.storage.put("relay_pub", rawPub);
+      }
+      const pubRaw = (await this.state.storage.get<Uint8Array>("relay_pub"))!;
+      const priv = await crypto.subtle.importKey(
+        "pkcs8", ed25519SeedToPkcs8(seed) as BufferSource,
+        { name: "Ed25519" } as AlgorithmIdentifier, false, ["sign"]);
+      const msg = concat(new TextEncoder().encode(RELAY_AUTH_INFO), clientFp,
+        pubRaw, ts);
+      const sig = await crypto.subtle.sign(
+        { name: "Ed25519" } as AlgorithmIdentifier, priv, msg as BufferSource);
+      return json(200, {
+        ok: true,
+        relay_pub: b64urlEncode(pubRaw),
+        relay_sig: b64urlEncode(new Uint8Array(sig)),
+      });
+    }
     return json(404, { ok: false, error: "not found" });
   }
+}
+
+const RELAY_AUTH_INFO = "nbx-relay-server-auth-v1";
+
+/** 把 32B Ed25519 seed 包成 PKCS#8（WebCrypto importKey 需要容器格式）。 */
+function ed25519SeedToPkcs8(seed: Uint8Array): Uint8Array {
+  // PKCS#8 Ed25519 前缀（RFC 8410）：48 字节容器，最后 32 字节是 seed
+  const pkcs8 = new Uint8Array(48);
+  pkcs8.set([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b,
+             0x65, 0x70, 0x04, 0x22, 0x04, 0x20], 0);
+  pkcs8.set(seed, 16);
+  return pkcs8;
 }

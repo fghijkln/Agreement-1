@@ -42,14 +42,10 @@ def test_handshake_signature_binds_eph():
     """握手签名绑定临时公钥：篡改 eph_pub → 验签拒绝。"""
     alice_id, bob_id = Identity.generate(), Identity.generate()
     hs = make_handshake(alice_id, b"\x11" * 32)
-    assert verify_handshake(
-        alice_id.ed_priv.public_key().public_key_bytes()
-        if False else alice_id.ed_priv.public_key().public_bytes(
-            __import__("cryptography.hazmat.primitives.serialization",
-                       fromlist=["Encoding"]).Encoding.Raw,
-            __import__("cryptography.hazmat.primitives.serialization",
-                       fromlist=["PublicFormat"]).PublicFormat.Raw),
-        hs) == b"\x11" * 32
+    from cryptography.hazmat.primitives import serialization
+    alice_ed = alice_id.ed_priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    assert verify_handshake(alice_ed, hs) == b"\x11" * 32
     # 篡改
     bad = bytearray(hs); bad[9] ^= 1
     from cryptography.hazmat.primitives import serialization
@@ -101,7 +97,6 @@ def test_dh_ratchet_on_reply():
     a, b, *_ = _setup_sessions()
     first_pub = a.send_ratchet_pub
     a.encrypt(b"m1")
-    b.decrypt(b.encrypt.__self__.encrypt(b"m1")) if False else None
     # Bob 收到 → 回信（Bob 是后发起者，首次发送会做初始 ratchet）
     ct = b.encrypt(b"reply")
     assert a.decrypt(ct) == b"reply"

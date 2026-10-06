@@ -73,10 +73,11 @@ async function authProof(keys: { priv: CryptoKey }, fp: Uint8Array): Promise<Uin
   return concat(t, sig);
 }
 
-/** 投递签名后缀: ts(8) || sig(64)，sig 覆盖 AUTH_INFO||明文头(48)||ts */
-async function deliveryProof(keys: { priv: CryptoKey }, header: Uint8Array): Promise<Uint8Array> {
+/** 投递签名后缀: ts(8) || sig(64)，R2-02 后 sig 覆盖 DELIVERY_INFO||SHA256(完整信封)||ts */
+async function deliveryProof(keys: { priv: CryptoKey }, envelope: Uint8Array): Promise<Uint8Array> {
   const t = tsBytes();
-  const sig = await sign(keys.priv, concat(new TextEncoder().encode(AUTH_INFO), header, t));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", envelope as BufferSource));
+  const sig = await sign(keys.priv, concat(new TextEncoder().encode("nbx-relay-delivery-v2"), digest, t));
   return concat(t, sig);
 }
 
@@ -133,7 +134,7 @@ describe("nbx workers relay", () => {
     // 带投递签名 → 202（签名只覆盖 48B 明文头）
     r = await SELF.fetch("https://example.com/envelope", {
       method: "POST",
-      body: concat(env, await deliveryProof(alice, env.slice(0, 48))) as unknown as BodyInit,
+      body: concat(env, await deliveryProof(alice, env)) as unknown as BodyInit,
     });
     expect(r.status).toBe(202);
 
@@ -164,7 +165,7 @@ describe("nbx workers relay", () => {
     const env = packMessage(1, malloryFp, bobFp, new TextEncoder().encode("spam"));
     const r = await SELF.fetch("https://example.com/envelope", {
       method: "POST",
-      body: concat(env, await deliveryProof(mallory, env.slice(0, 48))) as unknown as BodyInit,
+      body: concat(env, await deliveryProof(mallory, env)) as unknown as BodyInit,
     });
     expect(r.status).toBe(403);            // 未登记发送者不得投递
   });

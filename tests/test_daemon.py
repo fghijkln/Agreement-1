@@ -85,7 +85,6 @@ def test_outbox_flush_order(tmp_path):
     rs.begin(a.identity)
     import nbx.chat as chat
     peer_x, peer_ed = __import__("nbx.fskey", fromlist=["Identity"]).Identity.parse_public(pub_b)
-    rs.finish(a.identity, peer_ed, None, speaks_first=True) if False else None
     # 直接构造最小 session 桩
     class StubSession:
         def encrypt(self, data, outer_aad=b""):

@@ -54,10 +54,11 @@ def _pack(ptype, sfp, rfp, body=b""):
 
 
 def _proof_of(i: Identity, env: bytes) -> bytes:
-    """构造投递签名后缀（ts||sig），签名覆盖明文头。"""
-    import struct as _s
+    """构造投递签名后缀（ts||sig），R2-02: 签名覆盖完整信封。"""
+    import hashlib, struct as _s
     ts = _s.pack("<Q", int(time.time()))
-    return ts + i.ed_priv.sign(b"nbx-relay-auth-v1" + env[:msg.HEADER_SIZE] + ts)
+    digest = hashlib.sha256(env).digest()
+    return ts + i.ed_priv.sign(b"nbx-relay-delivery-v2" + digest + ts)
 
 
 # ---------- RelayLogic 单元 ----------
