@@ -237,7 +237,118 @@ key = HKDF-SHA256(master, salt=salt, info="nbx-anonymity-wrapper-v1")
 
 v1 容器（魔数 `NBXFILE\x01`）单流、无 TLV，仅保留代码供读取旧文件，不再生成。帧类型 0x02 FILE 同理，已被 BEGIN/CHUNK/END 取代。
 
-## 7. 威胁模型与边界
+## 7. Double Ratchet 会话（nbx/ratchet.py，IM 层）
+
+文件信封（第 4 节）解决"一条消息的安全投递"，本节解决"一个会话的连续对话"：每条消息独立密钥、被攻破的链在下一次轮换后自愈、消息乱序仍可解。
+
+### 9.1 会话建立（对称双临时密钥）
+
+1. 双方各生成临时 X25519 密钥对：Alice 持 E_a，Bob 持 E_b。
+2. 交换握手载荷（经 FS 信封等认证信道）：
+
+```
+握手: MAGIC(9) || eph_pub(32) || ts(8) || sig(64)      共 113 字节
+sig  = Ed25519_sign(发送方, "NBXRATCH1" || eph_pub || ts)
+```
+
+3. 双方各自派生共享密钥——salt 按字典序拼接，保证两端输入相同：
+
+```
+SK = HKDF-SHA256(DH(E_a, E_b), salt=sorted(E_a_pub, E_b_pub) 拼接,
+                 info="nbx-ratchet-handshake-v1", 64B)
+RK = SK[:32]          根链
+CK0 = SK[32:64]       初始链（单向，只能一方发送用）
+```
+
+4. 角色分配：先发言方持发送链（send_ck = CK0），后发言方持接收链（recv_ck = CK0）。两方必须恰好一方先发——同一链密钥双向使用会密钥重用。后发言方首次发送时做发送侧 DH step 换新链。
+
+### 9.2 消息格式
+
+```
+报文: header(40) || nonce(12) || ct
+header: ratchet_pub(32) || prev_chain_len(4, LE u32) || msg_no(4, LE u32)
+AAD = "NBXRATCH1" || header
+ct   = ChaCha20-Poly1305(message_key, nonce, AAD, plaintext)
+```
+
+头部明文可见（服务器无需解密即可读），但被 AAD 绑定——篡改任何字节解密即失败。`ratchet_pub` 是发送方当前 ratchet 公钥；`prev_chain_len` 是上一条链发出的消息数，供收方补齐 skipped keys；`msg_no` 是本链内序号。
+
+### 9.3 链的推进与轮换
+
+```
+KDF_CK(ck) = HKDF-SHA256(ikm=ck, info="nbx-ratchet-chain-v1", 64B)
+             → (next_ck, message_key)        每发/收一条消息推进一次
+KDF_RK(rk, dh_out) = HKDF-SHA256(ikm=dh_out, salt=rk,
+                 info="nbx-ratchet-root-v1", 64B)
+             → (new_rk, new_chain_key)       每次 DH 轮换调用
+```
+
+- **发送**：推进 send 链，message_key 加密后即焚。
+- **接收**：`ratchet_pub` 与已知的相同 → 推进 recv 链到 msg_no；不同 → 先做接收侧 DH step（KDF_RK(rk, DH(dh_self, 新公钥))）开新接收链。
+- **发送侧轮换**：每方在收到对方新 ratchet 公钥后的首次发送（或后发言方首次发送）生成新的 ratchet 密钥对，send 链 = KDF_RK(rk, DH(新私钥, 对方当前公钥))。此后双方 ratchet 公钥交替换新。
+
+### 9.4 乱序与重放
+
+- 乱序：消息 5 先于 3、4 到达时，接收链推进过程中跳过的 message_key 存入缓存，键为 `(ratchet_pub, msg_no)`，上限 MAX_SKIP=256。3、4 后到时从缓存取出解密（命中即焚）。超过上限拒绝。
+- 重放：同一条密文第二次到达时 msg_no 已被推进且 skipped 缓存无此键 → `message already processed` 拒绝。消息级重放防护不依赖时间窗（与 4.5 的信封级防护独立并存）。
+
+### 9.5 安全性质与边界
+
+- 逐消息前向保密：攻破当前链密钥推不出已焚的 message_key。
+- 恢复性（PCS）：某条链被攻破后，双方下一次 DH 轮换引入新鲜 DH 输出，链自愈。
+- 初始认证：握手签名绑定 eph_pub + 时间戳，防 MITM 篡改临时公钥；身份真实性靠 TOFU 指纹核对（与 4.2 同源）。
+- 已知边界：DH step 用 X25519，不含 PQ——PQ 混合在信封层（4.3），ratchet 层的 PQ 化（KEM 替代 DH step）留待后续版本；会话状态仅存内存，进程重启即失效，需重新握手。
+
+## 8. 消息信封（nbx/message.py，IM 层）
+
+IM 消息 = 明文头（服务器路由所需的最小元数据）+ 加密体（9 节的 ratchet 报文）。正文、文件名、时间戳全部在加密体内，服务器不可见。
+
+### 10.1 明文头（48 字节）
+
+```
+偏移  大小  字段
+0     8    魔数 "NBXMSG\x01\x00"
+8     1    版本 (1)
+9     1    负载类型 ptype
+10    1    标志位 (预留)
+11    1    保留 (0)
+12    8    发送方指纹 (SHA-256(身份公钥材料) 前 8 字节)
+20    8    接收方指纹
+28    16   msg_id（随机，去重/已读回执引用）
+44    4    body 长度 (LE u32)
+48    N    加密体（ratchet 报文）
+```
+
+头部无校验和：它是明文路由元数据，完整性由加密体 AEAD 与长度校验（body 长度不符即拒）兜底。篡改指纹只会送错人，不会骗过收方解密。
+
+### 10.2 负载类型
+
+| ptype | 名称 | 用途 |
+|-------|------|------|
+| 0x01 | TEXT | 文本消息 |
+| 0x02 | FILE_OFFER | 文件提供（加密体内：文件名+大小+SHA-256，等 ACK） |
+| 0x03 | FILE_CHUNK | 文件分块（加密体内：offset+数据，支持乱序重组） |
+| 0x04 | FILE_ACK | 文件确认 |
+| 0x05 | TYPING | 正在输入 |
+| 0x06 | READ | 已读回执（加密体内：已读到的 msg_id） |
+| 0x07 | HANDSHAKE | ratchet 握手载荷（FS 信封外壳） |
+| 0x08 | PING | 存活探测 |
+| 0x09 | PONG | 存活应答 |
+
+### 10.3 加密体内的字段编码
+
+TEXT/READ/FILE_* 的明文用小型 TLV：`type(1, LE u8) || len(4, LE u32) || value`。
+
+| type | 字段 |
+|------|------|
+| 1 | 文本 / 分块数据 |
+| 2 | msg_id 引用（已读回执） |
+| 3 | 文件名 |
+| 4 | 文件大小 (LE u64) |
+| 5 | SHA-256 (32B) |
+| 6 | 分块偏移 (LE u64) |
+
+## 9. 威胁模型与边界
 
 | 对手 | 防护 |
 |------|------|
@@ -248,11 +359,12 @@ v1 容器（魔数 `NBXFILE\x01`）单流、无 TLV，仅保留代码供读取�
 | 元数据采集 | Anonymity Wrapper（需显式开启） |
 | 已长期掌握的私钥泄露 | FS / PQ 模式保护过去的会话；主密钥模式无此性质 |
 | 收方主动泄露 | 无法防护 |
-| 重放（重发旧信封） | 时间窗（±300s）+ 信封 ID 缓存（4.5 节） |
+| 重放（重发旧信封） | 信封级：时间窗（±300s）+ 信封 ID 缓存（4.5 节）；消息级：链序号 + skipped 缓存（7.4 节） |
+| 会话链被攻破 | Double Ratchet：下一次 DH 轮换引入新鲜 DH 输出，链自愈（7.5 节） |
 
-已知边界：TLS 层缺失——帧层裸奔在 TCP 上，依赖层级 4 提供机密性；时序侧信道——ML-KEM-768 使用 vendored 纯 Python 实现（kyber-py），非常时实现，解封耗时可能侧漏信息，本协议按"无物理旁路、非实时"对手建模，高对抗部署应换用常时（constant-time）KEM 实现或 liboqs。
+已知边界：TLS 层缺失——帧层裸奔在 TCP 上，依赖层级 4 提供机密性；时序侧信道——ML-KEM-768 使用 vendored 纯 Python 实现（kyber-py），非常时实现，解封耗时可能侧漏信息，本协议按"无物理旁路、非实时"对手建模，高对抗部署应换用常时（constant-time）KEM 实现或 liboqs；会话密钥协商层（7 节 Double Ratchet）的 DH step 仍为 X25519，不含后量子成分，抗量子的存档攻击需在信封层（4.3 PQ 混合）实现；ratchet 会话状态仅存内存，进程重启后需重新握手。
 
-## 8. CLI 一览
+## 10. CLI 一览
 
 ```
 nbx keygen / pack / unpack          主密钥模式

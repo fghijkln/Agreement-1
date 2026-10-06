@@ -71,6 +71,9 @@ nbx/
 ├── fskey.py       FS 信封：X25519 临时 + Ed25519 签名
 ├── pq/            PQ 混合信封：+ ML-KEM-768（vendored kyber-py）
 ├── anon.py        Anonymity Wrapper：元数据加密 + 长度填充
+├── replay.py      重放防护：时间窗 + 信封 ID 持久缓存
+├── ratchet.py     Double Ratchet 会话：逐消息前向保密、DH 轮换、乱序容忍
+├── message.py     IM 消息信封：9 种负载类型，正文全在加密体
 ├── protocol.py    线路帧：HELLO/ACK/BYE/BEGIN/CHUNK/END
 ├── transfer.py    收发两端：64 KiB 分块、流式 SHA-256 校验
 ├── viewer.py      终端渲染（markdown/html/hexdump，解密在内存）
@@ -83,10 +86,16 @@ nbx/
 python3 tests/test_carrier.py    # 容器 roundtrip、嗅探、bundle、加密、篡改检测
 python3 tests/test_fskey.py      # FS：冒充拒绝、篡改拒绝、前向保密性质
 python3 tests/test_pq_anon.py    # PQ 混合、KEM 随机性、匿名包装、E2E 强制
+python3 tests/test_replay.py     # 重放防护：时间窗、缓存持久化、旧攻击面回归
+python3 tests/test_ratchet.py    # ratchet：前向保密、乱序、重放、文件分块、FS 完整栈
 ```
+
+## IM 会话（Double Ratchet）
+
+文件信封之上的会话层，面向即时通讯：每条消息独立密钥（用后即焚），收到对方新 ratchet 公钥即轮换链（被攻破的链自愈），消息乱序仍可解（skipped keys 缓存，上限 256）。握手双方各出临时 X25519 密钥，Ed25519 签名绑定，经 FS 信封交换。消息信封明文头只含路由元数据（收发方指纹 + msg_id + 类型），正文、文件名、已读回执全在加密体内。字节级布局见 SPEC.md 第 7、8 节。
 
 ## 安全边界
 
-防：线路窃听、密文篡改、身份冒充、未来量子解密（PQ 模式）、元数据采集（AW 模式）。
+防：线路窃听、密文篡改、身份冒充、未来量子解密（PQ 模式）、元数据采集（AW 模式）、信封重放（时间窗 ±300s + 信封 ID 持久缓存）、消息重放（链序号 + skipped 缓存）。
 
-不防：接收方主动泄露；已知明文攻击下的重放（信封可被重放，暂无时间戳绑定）；帧层未接入 TLS，机密性完全依赖加密信封；时序侧信道——ML-KEM-768 为 vendored 纯 Python 实现（kyber-py，非常时实现），高对抗场景下解封操作的时间可能泄露信息，当前按非实时、无物理旁路对手建模。细节见 SPEC.md 第 7 节。
+不防：接收方主动泄露；帧层未接入 TLS，机密性完全依赖加密信封；时序侧信道——ML-KEM-768 为 vendored 纯 Python 实现（kyber-py，非常时实现），高对抗场景下解封操作的时间可能泄露信息，当前按非实时、无物理旁路对手建模；ratchet 的 DH 轮换仍为 X25519，不含后量子成分，抗量子存档攻击依赖信封层的 PQ 混合。细节见 SPEC.md 第 9 节。
