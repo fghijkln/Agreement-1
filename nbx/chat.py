@@ -103,6 +103,7 @@ class ChatSession:
         self.client = RelayClient(relay_base)
         self.speaks_first = speaks_first
         self.session: RatchetSession | None = None
+        self._pending: list[bytes] = []      # 等待握手期间取到、待后续处理的消息
 
     # ---------- 会话建立 ----------
 
@@ -126,6 +127,8 @@ class ChatSession:
                 m = msg.parse_message(blob)
                 if m["ptype"] == msg.PT_HANDSHAKE:
                     return m["body"]
+                # 正文先到（与握手同批）：缓存，poll_once 时解密
+                self._pending.append(blob)
             time.sleep(1.0)
         raise TimeoutError("peer handshake not received in time")
 
@@ -142,8 +145,11 @@ class ChatSession:
     def poll_once(self) -> list[tuple[int, str]]:
         """取信并解密，返回 [(ptype, text), ...]。"""
         out = []
-        for blob in self.client.fetch(
-                self.my_fp, auth_proof(self.identity, self.my_fp)):
+        blobs = self._pending
+        self._pending = []
+        blobs += self.client.fetch(
+            self.my_fp, auth_proof(self.identity, self.my_fp))
+        for blob in blobs:
             m = msg.parse_message(blob)
             if m["ptype"] == msg.PT_TEXT:
                 out.append((msg.PT_TEXT,
