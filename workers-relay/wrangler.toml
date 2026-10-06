@@ -1,0 +1,11 @@
+name = "nbx-relay"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+
+[[durable_objects.bindings]]
+name = "NBX_FP"
+class_name = "NbxFpDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NbxFpDurableObject"]
