@@ -1,0 +1,19 @@
+# Flet Android 构建配置 (flet build apk)
+# 文档: https://flet.dev/docs/guides/python/packaging-android-app
+project:
+  org: com.nebula
+  name: nbxmessenger
+  description: NBX 端到端加密即时通讯
+  version: 0.1.0
+
+android:
+  # Termux/手机端实测: 中继走 HTTPS 出站, 无需特殊权限
+  permissions:
+    - INTERNET
+    - POST_NOTIFICATIONS
+  min_sdk: 23          # Android 6.0+
+  target_sdk: 34
+
+dependencies:
+  - cryptography
+  - nbx  # 本仓库以 path 依赖打入 (见 build 命令 --include-packages)
