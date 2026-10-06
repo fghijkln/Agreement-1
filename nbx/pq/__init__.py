@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from .. import replay
 from ..vendor.kyber_py.ml_kem import ML_KEM_768
 
 NONCE_SIZE = 12
@@ -124,26 +125,34 @@ def seal_pq(data: bytes, sender: PQIdentity,
     key = _hkdf_hybrid(x_shared, kem_shared, eph_pub + rec_x_pub)
     nonce = secrets.token_bytes(NONCE_SIZE)
     ct = ChaCha20Poly1305(key).encrypt(nonce, data, None)
-    sig = sender.ed_priv.sign(eph_pub + kem_ct + rec_x_pub + ct)
-    return eph_pub + kem_ct + sig + nonce + ct
+    ts = replay.timestamp_now()
+    sig = sender.ed_priv.sign(eph_pub + kem_ct + ts + rec_x_pub + ct)
+    return eph_pub + kem_ct + ts + sig + nonce + ct
 
 
 def open_pq(blob: bytes, recipient: PQIdentity,
-            snd_x_pub: bytes, snd_ed_pub: bytes) -> bytes:
-    """解封并验签。"""
-    if len(blob) < X_PUB_SIZE + KEM_CT_SIZE + SIG_SIZE + NONCE_SIZE + 16:
+            snd_x_pub: bytes, snd_ed_pub: bytes,
+            cache: "replay.ReplayCache | None" = None,
+            max_skew: int = replay.DEFAULT_MAX_SKEW) -> bytes:
+    """解封并验签：验签 → 时间窗 → 重放缓存 → 解密。"""
+    if len(blob) < X_PUB_SIZE + KEM_CT_SIZE + 8 + SIG_SIZE + NONCE_SIZE + 16:
         raise ValueError("PQ envelope too short")
     p = 0
     eph_pub = blob[p:p + X_PUB_SIZE]; p += X_PUB_SIZE
     kem_ct = blob[p:p + KEM_CT_SIZE]; p += KEM_CT_SIZE
+    ts = blob[p:p + 8]; p += 8
     sig = blob[p:p + SIG_SIZE]; p += SIG_SIZE
     nonce = blob[p:p + NONCE_SIZE]; p += NONCE_SIZE
     ct = blob[p:]
-    # 验签（发送方 Ed25519，绑定全部握手材料）
+    # 验签（发送方 Ed25519，绑定全部握手材料含时间戳）
     my_x_pub = recipient.x_priv.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     ed25519.Ed25519PublicKey.from_public_bytes(snd_ed_pub).verify(
-        sig, eph_pub + kem_ct + my_x_pub + ct)
+        sig, eph_pub + kem_ct + ts + my_x_pub + ct)
+    # 重放防护
+    replay.check_timestamp(ts, max_skew)
+    if cache is not None:
+        cache.check_and_remember(replay.envelope_id(eph_pub + kem_ct, ct))
     # 经典侧
     x_shared = recipient.x_priv.exchange(
         x25519.X25519PublicKey.from_public_bytes(eph_pub))

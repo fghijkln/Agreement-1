@@ -169,13 +169,15 @@ SHA-256 覆盖整个载荷（含 TLV 头）。校验失败必须拒绝解析，�
 身份 = X25519 静态（协商）+ Ed25519 静态（签名），序列化为 raw 64 字节 Base64。
 
 ```
-信封: eph_pub(32) || sig(64) || nonce(12) || ct
+信封: eph_pub(32) || ts(8) || sig(64) || nonce(12) || ct
 shared = X25519(eph_priv, 静态收方公钥)
 key    = HKDF-SHA256(shared, salt=eph_pub || 收方公钥, info="nbx-fs-session-key-v1")
-sig    = Ed25519_sign(发送方, eph_pub || 收方公钥 || ct)
+sig    = Ed25519_sign(发送方, eph_pub || ts || 收方公钥 || ct)
 ```
 
-开销恒定 108 字节。发送后临时私钥销毁；长期私钥日后泄露也无法解出旧会话。收方先验签后解密。
+开销恒定 116 字节（含 8B 重放防护时间戳）。发送后临时私钥销毁；长期私钥日后泄露也无法解出旧会话。收方先验签后解密。
+
+重放防护（FS 与 PQ 共用，见 5.1）：解封前校验时间窗（默认 ±300 秒）并查信封 ID 缓存。
 
 ### 4.3 PQ 混合信封（nbx/pq/）— 抗量子
 
@@ -184,21 +186,30 @@ sig    = Ed25519_sign(发送方, eph_pub || 收方公钥 || ct)
 身份 = X25519 静态 + Ed25519 静态 + ML-KEM-768 静态（ek 1184B / dk 2400B）。
 
 ```
-信封: eph_x_pub(32) || kem_ct(1088) || sig(64) || nonce(12) || ct
+信封: eph_x_pub(32) || kem_ct(1088) || ts(8) || sig(64) || nonce(12) || ct
 x_shared   = X25519(eph_priv, 收方 X25519 公钥)
 kem_shared = ML-KEM-768.encaps(收方 ek).shared
 key        = HKDF-SHA256(x_shared || kem_shared, salt=eph_pub || 收方公钥,
                          info="nbx-pq-hybrid-session-v1")
-sig        = Ed25519_sign(发送方, eph_pub || kem_ct || 收方公钥 || ct)
+sig        = Ed25519_sign(发送方, eph_pub || kem_ct || ts || 收方公钥 || ct)
 ```
 
-开销恒定 1212 字节。两路共享秘密拼接后经 HKDF 混合：X25519 与 ML-KEM 需同时被破才威胁会话密钥。量子攻击者破解 X25519 后仍被 KEM 侧挡住。
+开销恒定 1220 字节（含 8B 重放防护时间戳）。两路共享秘密拼接后经 HKDF 混合：X25519 与 ML-KEM 需同时被破才威胁会话密钥。量子攻击者破解 X25519 后仍被 KEM 侧挡住。
 
 安全级别：NIST Category 1（ML-KEM-768 ≈ AES-128 级，实现取 AES-192 参考点）。
 
 ### 4.4 签名绑定
 
-FS 与 PQ 信封的签名都覆盖「临时公钥 + 接收方公钥 + 密文」。改任何一项都会导致验签失败，冒充第三方身份同样失败。
+FS 与 PQ 信封的签名都覆盖「临时公钥 + 时间戳 + 接收方公钥 + 密文」。改任何一项都会导致验签失败，冒充第三方身份同样失败。
+
+### 4.5 重放防护（nbx/replay.py）
+
+两级机制，解封顺序：验签 → 时间窗 → 缓存 → 解密。
+
+1. 时间窗：信封内 8 字节 Unix 时间戳（LE u64），解封方校验 `|now - ts| <= max_skew`（默认 300 秒）。过期/超前信封直接拒绝——即使签名合法。发送方时钟偏差超过窗口会导致合法信封被拒，部署时需 NTP 对时。
+2. 信封 ID 缓存：`SHA-256(eph_pub [|| kem_ct] || ct)` 前 16 字节。解封成功后记入缓存（默认 `~/.nbx_replay_cache.json`，TTL 86400 秒，原子写入）。有效期内重复 ID 拒绝。ephemeral 密钥每次随机生成，正常通信不会撞 ID。
+
+边界：时间窗内的重放若发生在缓存写入前的并发场景（多进程同时解封同一信封）存在竞态；时钟回拨超窗口的发送方需重发。
 
 ## 5. Anonymity Wrapper（nbx/anon.py，层级 5，可选）
 
@@ -237,8 +248,9 @@ v1 容器（魔数 `NBXFILE\x01`）单流、无 TLV，仅保留代码供读取�
 | 元数据采集 | Anonymity Wrapper（需显式开启） |
 | 已长期掌握的私钥泄露 | FS / PQ 模式保护过去的会话；主密钥模式无此性质 |
 | 收方主动泄露 | 无法防护 |
+| 重放（重发旧信封） | 时间窗（±300s）+ 信封 ID 缓存（4.5 节） |
 
-已知边界：TLS 层缺失——帧层裸奔在 TCP 上，依赖层级 4 提供机密性；不含重放保护，同一信封可被重放（时间戳字段未纳入签名绑定）；时序侧信道——ML-KEM-768 使用 vendored 纯 Python 实现（kyber-py），非常时实现，解封耗时可能侧漏信息，本协议按"无物理旁路、非实时"对手建模，高对抗部署应换用常时（constant-time）KEM 实现或 liboqs。
+已知边界：TLS 层缺失——帧层裸奔在 TCP 上，依赖层级 4 提供机密性；时序侧信道——ML-KEM-768 使用 vendored 纯 Python 实现（kyber-py），非常时实现，解封耗时可能侧漏信息，本协议按"无物理旁路、非实时"对手建模，高对抗部署应换用常时（constant-time）KEM 实现或 liboqs。
 
 ## 8. CLI 一览
 

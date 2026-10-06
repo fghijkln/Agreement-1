@@ -73,11 +73,11 @@ def test_forward_secrecy(tmp_path):
 
 
 def test_envelope_size_stable(tmp_path):
-    """信封头部长度恒定: 32(eph) + 64(sig) + 12(nonce) = 108B 开销。"""
+    """信封头部长度恒定: 32(eph) + 8(ts) + 64(sig) + 12(nonce) = 116B 开销。"""
     a, b = fskey.Identity.generate(), fskey.Identity.generate()
     env = fskey.seal_envelope(b"x", a, *fskey.Identity.parse_public(b.export_public()))
-    assert len(env) == 108 + 1 + 16
-    print(f"✓ 信封开销恒定 108B（总 {len(env)}B for 1B payload）")
+    assert len(env) == 116 + 1 + 16
+    print(f"✓ 信封开销恒定 116B（含 8B 重放防护时间戳, 总 {len(env)}B for 1B payload）")
 
 
 if __name__ == "__main__":

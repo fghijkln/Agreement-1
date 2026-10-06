@@ -220,20 +220,23 @@ def main(argv=None):
         env = fskey.seal_envelope(data, ident, to_x, to_ed)
         with open(args.outfile, "wb") as f:
             f.write(env)
-        print(f"sealed {args.infile} -> {args.outfile} ({len(env)} bytes, forward-secure)")
+        print(f"sealed {args.infile} -> {args.outfile} ({len(env)} bytes, forward-secure, replay-protected)")
 
     elif args.cmd == "unseal":
-        from . import fskey
+        from . import fskey, replay
         ident = fskey.Identity.load(args.my_id)
         from_x, from_ed = fskey.Identity.parse_public(open(args.from_pub).read().strip())
         env = open(args.infile, "rb").read()
+        cache = replay.ReplayCache()
         try:
-            plain = fskey.open_envelope(env, ident, from_x, from_ed)
+            plain = fskey.open_envelope(env, ident, from_x, from_ed, cache=cache)
+        except ValueError as e:
+            sys.exit(f"unseal failed: {e}")
         except Exception as e:
             sys.exit(f"unseal failed (wrong key or tampered): {e}")
         with open(args.outfile, "wb") as f:
             f.write(plain)
-        print(f"unsealed -> {args.outfile} ({len(plain)} bytes, signature verified)")
+        print(f"unsealed -> {args.outfile} ({len(plain)} bytes, signature+replay verified)")
 
     elif args.cmd == "anon":
         from . import anon
@@ -262,20 +265,23 @@ def main(argv=None):
         env = pq.seal_pq(data, ident, *rec)
         with open(args.outfile, "wb") as f:
             f.write(env)
-        print(f"pq-sealed {args.infile} -> {args.outfile} ({len(env)}B, X25519+ML-KEM-768)")
+        print(f"pq-sealed {args.infile} -> {args.outfile} ({len(env)}B, X25519+ML-KEM-768, replay-protected)")
 
     elif args.cmd == "pqunseal":
-        from . import pq
+        from . import pq, replay
         ident = pq.PQIdentity.load(args.my_id)
         snd = pq.PQIdentity.parse_public(open(args.from_pub).read().strip())
         env = open(args.infile, "rb").read()
+        cache = replay.ReplayCache()
         try:
-            plain = pq.open_pq(env, ident, snd[0], snd[1])
+            plain = pq.open_pq(env, ident, snd[0], snd[1], cache=cache)
+        except ValueError as e:
+            sys.exit(f"pq-unseal failed: {e}")
         except Exception as e:
             sys.exit(f"pq-unseal failed: {e}")
         with open(args.outfile, "wb") as f:
             f.write(plain)
-        print(f"pq-unsealed -> {args.outfile} ({len(plain)}B, signature verified)")
+        print(f"pq-unsealed -> {args.outfile} ({len(plain)}B, signature+replay verified)")
 
     elif args.cmd == "send":
         print(transfer.send_file(args.file, args.host, args.port, args.keyfile))
