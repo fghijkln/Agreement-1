@@ -26,6 +26,13 @@ from .fskey import Identity
 from .ratchet import RatchetSession
 
 AUTH_INFO = b"nbx-relay-auth-v1"
+_UA = "NBX-Client/1.0"          # 部分 Cloudflare 前置拦截无 UA / 默认 UA 的请求
+
+
+def _http_req(url: str, data: bytes | None = None, method: str = "GET"):
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"User-Agent": _UA})
+    return req
 
 
 def _b64e(b: bytes) -> str:
@@ -53,8 +60,7 @@ class RelayClient:
         self.base = base.rstrip("/")
 
     def post_envelope(self, blob: bytes) -> dict:
-        req = urllib.request.Request(self.base + "/envelope", data=blob,
-                                     method="POST")
+        req = _http_req(self.base + "/envelope", data=blob, method="POST")
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
 
@@ -69,8 +75,7 @@ class RelayClient:
                 __import__("cryptography.hazmat.primitives.serialization",
                            fromlist=["PublicFormat"]).PublicFormat.Raw)
         body = fp + ts + ed_pub + identity.ed_priv.sign(AUTH_INFO + fp + ts)
-        req = urllib.request.Request(self.base + "/auth", data=body,
-                                     method="POST")
+        req = _http_req(self.base + "/auth", data=body, method="POST")
         with urllib.request.urlopen(req, timeout=10) as r:
             obj = json.loads(r.read())
         if not obj.get("ok"):
@@ -79,7 +84,7 @@ class RelayClient:
     def fetch(self, fp: bytes, proof: bytes) -> list[bytes]:
         url = f"{self.base}/inbox/{_b64e(fp)}?proof={_b64e(proof)}"
         try:
-            with urllib.request.urlopen(url, timeout=10) as r:
+            with urllib.request.urlopen(_http_req(url), timeout=10) as r:
                 obj = json.loads(r.read())
             return [_b64d(e) for e in obj.get("envelopes", [])]
         except urllib.error.HTTPError as e:
