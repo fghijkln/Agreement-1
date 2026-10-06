@@ -1,0 +1,238 @@
+"""NBX Double Ratchet v1（nbx/ratchet.py）— IM 会话加密核心。
+
+参考 Signal Double Ratchet。关键组件：
+
+- 根链 RK：HKDF 迭代，KDF_RK(rk, dh_out) = HKDF(ikm=dh_out, salt=rk)。
+- 发送/接收链 CK：每发/收一条消息推进一次
+  KDF_CK(ck) -> (next_ck, message_key)，消息密钥用后即焚 → 逐消息前向保密。
+- DH ratchet：每次发现对方换了 ratchet 公钥，用新的 DH 输出更新根链并开新链
+  → 被攻破链的恢复（post-compromise security）。
+
+会话建立（对称双临时密钥）：
+  Alice 生成 E_a，Bob 生成 E_b，双方交换（需经认证信道，外壳用 FS 信封）。
+  SK = HKDF(DH(E_a,E_b), salt=E_a_pub||E_b_pub, info=NBX_RATCHET_V1, 64B)
+  RK=SK[:32]；初始链 CK0=SK[32:]
+  Alice: DHs=E_a, DHr=E_b, send_ck=CK0
+  Bob:   DHs=E_b, DHr=E_a, recv_ck=CK0
+  → Alice 首条消息头部 ratchet_pub=E_a_pub，与 Bob 的 DHr 相同，不触发 step；
+    Bob 首次回信才真正做 DH ratchet（换新 DHs），此后交替。
+
+头部（40B，明文可见、作 AEAD 的 AAD）：
+  ratchet_pub(32) || prev_chain_len(4) || msg_no(4)
+  prev_chain_len：上一条链发了多少条，供收方补齐 skipped keys。
+
+报文：header(40) || nonce(12) || ChaCha20-Poly1305 密文（AAD = MAGIC||header）。
+
+安全性质：逐消息前向保密、收到新 ratchet 公钥即恢复、乱序容忍（skipped 键上限）。
+已知边界（见 SPEC）：初始认证靠 Ed25519 签名 + TOFU 指纹核对；DH step 用 X25519，
+不含 PQ（PQ 会话在信封层叠加）。
+"""
+from __future__ import annotations
+
+import secrets
+import struct
+import time
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from .fskey import Identity
+
+MAGIC_RATCHET = b"NBXRATCH1"
+HEADER_SIZE = 40
+NONCE_SIZE = 12
+MAX_SKIP = 256
+HANDSHAKE_SIZE = 9 + 32 + 8 + 64   # magic + eph_pub + ts + sig
+
+INFO_ROOT = b"nbx-ratchet-root-v1"
+INFO_CHAIN = b"nbx-ratchet-chain-v1"
+INFO_HANDSHAKE = b"nbx-ratchet-handshake-v1"
+
+
+def _kdf_ck(ck: bytes) -> tuple[bytes, bytes]:
+    """链密钥推进: ck -> (next_ck, message_key)。"""
+    okm = HKDF(algorithm=hashes.SHA256(), length=64,
+               salt=b"", info=INFO_CHAIN).derive(ck)
+    return okm[:32], okm[32:]
+
+
+def _kdf_rk(rk: bytes, dh_out: bytes) -> tuple[bytes, bytes]:
+    """根链推进: (rk, dh_out) -> (new_rk, chain_key)。"""
+    okm = HKDF(algorithm=hashes.SHA256(), length=64,
+               salt=rk, info=INFO_ROOT).derive(dh_out)
+    return okm[:32], okm[32:]
+
+
+def _dh(priv: x25519.X25519PrivateKey, pub: bytes) -> bytes:
+    return priv.exchange(x25519.X25519PublicKey.from_public_bytes(pub))
+
+
+def _raw_pub(priv: x25519.X25519PrivateKey) -> bytes:
+    return priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def pack_header(ratchet_pub: bytes, prev_len: int, msg_no: int) -> bytes:
+    return ratchet_pub + struct.pack("<II", prev_len, msg_no)
+
+
+def unpack_header(hdr: bytes) -> tuple[bytes, int, int]:
+    if len(hdr) != HEADER_SIZE:
+        raise ValueError("bad ratchet header")
+    return hdr[:32], struct.unpack("<I", hdr[32:36])[0], struct.unpack("<I", hdr[36:40])[0]
+
+
+def make_handshake(identity: Identity, eph_pub: bytes) -> bytes:
+    """MAGIC || eph_pub || ts(8) || Ed25519_sign(MAGIC||eph_pub||ts)。"""
+    ts = struct.pack("<Q", int(time.time()))
+    sig = identity.ed_priv.sign(MAGIC_RATCHET + eph_pub + ts)
+    return MAGIC_RATCHET + eph_pub + ts + sig
+
+
+def verify_handshake(peer_ed_pub: bytes, hs: bytes) -> bytes:
+    """验签并返回对端临时公钥；签名绑定 eph_pub + 时间戳。"""
+    if len(hs) != HANDSHAKE_SIZE or hs[:9] != MAGIC_RATCHET:
+        raise ValueError("bad handshake payload")
+    eph_pub, ts, sig = hs[9:41], hs[41:49], hs[49:113]
+    ed25519.Ed25519PublicKey.from_public_bytes(peer_ed_pub).verify(
+        sig, MAGIC_RATCHET + eph_pub + ts)
+    return eph_pub
+
+
+class RatchetSession:
+    """一条双向加密会话。"""
+
+    def __init__(self):
+        self._root_key: bytes = b""
+        self._send_ck: bytes | None = None
+        self._recv_ck: bytes | None = None
+        self._send_n = 0
+        self._recv_n = 0
+        self._prev_send_len = 0
+        self._dh_self: x25519.X25519PrivateKey | None = None
+        self._dh_remote_pub: bytes = b""
+        self._skipped: dict[tuple[bytes, int], bytes] = {}
+        self._established = False
+
+    # ---------- 建立（两阶段，双方交换临时密钥） ----------
+
+    def begin(self, my_id: Identity) -> bytes:
+        """阶段一：生成本方临时密钥并返回握手载荷。双方都调用。"""
+        self._eph = x25519.X25519PrivateKey.generate()
+        self._eph_pub = _raw_pub(self._eph)
+        return make_handshake(my_id, self._eph_pub)
+
+    def finish(self, my_id: Identity, peer_ed_pub: bytes, peer_hs: bytes,
+               speaks_first: bool):
+        """阶段二：验对方载荷 → 派生 SK → 初始化链。
+
+        speaks_first：本方是否先发消息。两方必须恰好一方为 True——
+        初始链 CK0 只能单向使用（避免同一链密钥双向密钥重用），
+        先发方持发送链，后发方持接收链；后发方首次发送时 DH ratchet 换新链。
+        """
+        peer_eph_pub = verify_handshake(peer_ed_pub, peer_hs)
+        dh_shared = _dh(self._eph, peer_eph_pub)
+        # salt 按字典序拼接，保证双方派生出同一 SK
+        lo, hi = sorted((self._eph_pub, peer_eph_pub))
+        sk = HKDF(algorithm=hashes.SHA256(), length=64,
+                  salt=lo + hi,
+                  info=INFO_HANDSHAKE).derive(dh_shared)
+        self._root_key, ck0 = sk[:32], sk[32:]
+        # 初始 ratchet 公钥用各自临时密钥，保证首条消息不触发多余 step
+        self._dh_self = self._eph
+        self._dh_self_pub = self._eph_pub
+        self._dh_remote_pub = peer_eph_pub
+        if speaks_first:
+            self._send_ck, self._recv_ck = ck0, None
+        else:
+            self._send_ck, self._recv_ck = None, ck0
+        self._established = True
+        return self
+
+    # ---------- 收发 ----------
+
+    def _recv_step(self, remote_pub: bytes, prev_len: int):
+        """收到对方新 ratchet 公钥：接收链 DH step。"""
+        assert self._dh_self is not None, "session not established"
+        if self._recv_ck is not None and self._dh_remote_pub:
+            self._skip_to(self._dh_remote_pub, prev_len)
+        shared = _dh(self._dh_self, remote_pub)
+        self._root_key, self._recv_ck = _kdf_rk(self._root_key, shared)
+        self._recv_n = 0
+        self._dh_remote_pub = remote_pub
+
+    def _send_step(self):
+        """发送侧 DH step：生成本方新 ratchet 密钥并派生新发送链。"""
+        assert self._dh_remote_pub, "no remote ratchet key"
+        self._prev_send_len = self._send_n
+        self._dh_self = x25519.X25519PrivateKey.generate()
+        self._dh_self_pub = _raw_pub(self._dh_self)
+        shared_s = _dh(self._dh_self, self._dh_remote_pub)
+        self._root_key, self._send_ck = _kdf_rk(self._root_key, shared_s)
+        self._send_n = 0
+
+    def _skip_to(self, ratchet_pub: bytes, until: int):
+        if self._recv_ck is None:
+            return
+        while self._recv_n < until:
+            self._recv_ck, mk = _kdf_ck(self._recv_ck)
+            self._skipped[(ratchet_pub, self._recv_n)] = mk
+            self._recv_n += 1
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """加密一条消息 → header(40) || nonce(12) || ct。"""
+        if not self._established:
+            raise RuntimeError("session not established")
+        if self._send_ck is None:
+            # 后发言方首次发送：只做发送侧 DH step（其接收链 CK0 不动）
+            self._send_step()
+        assert self._send_ck is not None
+        self._send_ck, mk = _kdf_ck(self._send_ck)
+        nonce = secrets.token_bytes(NONCE_SIZE)
+        hdr = pack_header(self._dh_self_pub, self._prev_send_len, self._send_n)
+        ct = ChaCha20Poly1305(mk).encrypt(nonce, plaintext, MAGIC_RATCHET + hdr)
+        self._send_n += 1
+        return hdr + nonce + ct
+
+    def decrypt(self, blob: bytes) -> bytes:
+        """解密一条消息（容忍乱序，skipped 键上限 MAX_SKIP）。"""
+        if not self._established:
+            raise RuntimeError("session not established")
+        if len(blob) < HEADER_SIZE + NONCE_SIZE + 16:
+            raise ValueError("message too short")
+        hdr = blob[:HEADER_SIZE]
+        nonce = blob[HEADER_SIZE:HEADER_SIZE + NONCE_SIZE]
+        ct = blob[HEADER_SIZE + NONCE_SIZE:]
+        ratchet_pub, prev_len, msg_no = unpack_header(hdr)
+        aad = MAGIC_RATCHET + hdr
+
+        # 1) skipped 命中（乱序补上，密钥用后即焚）
+        mk = self._skipped.pop((ratchet_pub, msg_no), None)
+        if mk is not None:
+            return ChaCha20Poly1305(mk).decrypt(nonce, ct, aad)
+
+        # 2) 对方换了 ratchet 公钥 → 接收链 DH step
+        if ratchet_pub != self._dh_remote_pub:
+            self._recv_step(ratchet_pub, prev_len)
+
+        # 3) 推进收链到 msg_no，中间密钥记为 skipped
+        if self._recv_ck is None:
+            raise ValueError("no receiving chain")
+        if msg_no < self._recv_n:
+            raise ValueError("message already processed")
+        if msg_no - self._recv_n > MAX_SKIP:
+            raise ValueError("too many skipped messages")
+        self._skip_to(ratchet_pub, msg_no)
+        self._recv_ck, mk = _kdf_ck(self._recv_ck)
+        self._recv_n += 1
+        return ChaCha20Poly1305(mk).decrypt(nonce, ct, aad)
+
+    @property
+    def send_ratchet_pub(self) -> bytes:
+        return self._dh_self_pub
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self._skipped)
