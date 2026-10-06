@@ -24,12 +24,40 @@ def _load_master_key(keyfile: str | None) -> bytes:
 
 
 def send_file(path: str, host: str, port: int, keyfile: str | None = None) -> str:
-    """分块流式发送任意文件（.nbx 或其他），接收端最后做 SHA-256 校验。"""
+    """分块流式发送文件。强制 E2E: 明文 .nbx / 普通文件在发送前自动加密。"""
+    from . import anon, carrier, crypto, format
     with open(path, "rb") as f:
         data = f.read()
+
+    # ---- 强制 E2E 检查 ----
+    e2e = False
+    if carrier.MAGIC[:7] == data[:7] == b"NBXFILE":  # NBX 容器
+        try:
+            _, _, flags = carrier.unpack(data)
+            e2e = bool(flags & carrier.FLAG_ENCRYPTED)
+        except carrier.NBXError:
+            e2e = False
+    elif anon.is_wrapper(data):
+        e2e = True  # 匿名包装内层必有加密
+    elif len(data) > 108 and data[:8] not in (b"NBXFILE\x02",):
+        # 可能是 FS/PQ 信封（无公开魔数, 全随机）——交给用户判断
+        pass
+    if not e2e:
+        # 明文内容: 自动用主密钥加密成 NBX 容器再传
+        master = _load_master_key(keyfile)
+        meta = {"type": "binary", "mime": "application/octet-stream",
+                "filename": os.path.basename(path),
+                "enc": "chacha20poly1305", "auto": True}
+        inner = crypto.encrypt(data, master)
+        data = carrier.pack([(carrier.TLV_BIN, inner)], meta,
+                            flags=carrier.FLAG_ENCRYPTED)
+        name = os.path.basename(path) + ".nbx"
+        print(f"[nbx] plaintext detected -> auto-encrypted for transfer ({len(data)}B)")
+    else:
+        name = os.path.basename(path)
+
     total = len(data)
     digest = hashlib.sha256(data).digest()
-    name = os.path.basename(path)
     chunks = [data[i:i + CHUNK] for i in range(0, total, CHUNK)] or [b""]
 
     t0 = time.time()

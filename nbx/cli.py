@@ -76,6 +76,25 @@ def main(argv=None):
     un.add_argument("--my-id", default="nbx_id.key")
     un.add_argument("--from-pub", required=True, help="发送方身份公钥文件(Base64)")
 
+    an = sub.add_parser("anon", help="Anonymity Wrapper: 元数据加密外层")
+    an.add_argument("action", choices=["pack", "unpack"])
+    an.add_argument("infile")
+    an.add_argument("outfile")
+    an.add_argument("--keyfile", default="nbx.key")
+    an.add_argument("--pad", type=int, default=0, help="长度填充块大小(如4096)")
+
+    pqc = sub.add_parser("pqseal", help="后量子混合信封 (X25519+ML-KEM-768)")
+    pqc.add_argument("infile")
+    pqc.add_argument("outfile")
+    pqc.add_argument("--my-id", default="nbx_id.key")
+    pqc.add_argument("--to-pub", required=True)
+
+    pqu = sub.add_parser("pqunseal", help="解封后量子信封")
+    pqu.add_argument("infile")
+    pqu.add_argument("outfile")
+    pqu.add_argument("--my-id", default="nbx_id.key")
+    pqu.add_argument("--from-pub", required=True)
+
     args = p.parse_args(argv)
 
     if args.cmd == "keygen":
@@ -215,6 +234,48 @@ def main(argv=None):
         with open(args.outfile, "wb") as f:
             f.write(plain)
         print(f"unsealed -> {args.outfile} ({len(plain)} bytes, signature verified)")
+
+    elif args.cmd == "anon":
+        from . import anon
+        master = _read_key(args.keyfile)
+        data = open(args.infile, "rb").read()
+        if args.action == "pack":
+            blob = anon.wrap(data, master, pad_block=args.pad)
+            with open(args.outfile, "wb") as f:
+                f.write(blob)
+            print(f"anon-wrapped -> {args.outfile} ({len(data)}B inner -> {len(blob)}B outer,"
+                  f" pad_block={args.pad or 'off'})")
+        else:
+            try:
+                inner = anon.unwrap(data, master)
+            except Exception as e:
+                sys.exit(f"unwrap failed: {e}")
+            with open(args.outfile, "wb") as f:
+                f.write(inner)
+            print(f"unwrapped -> {args.outfile} ({len(inner)}B)")
+
+    elif args.cmd == "pqseal":
+        from . import pq
+        ident = pq.PQIdentity.load(args.my_id)
+        rec = pq.PQIdentity.parse_public(open(args.to_pub).read().strip())
+        data = open(args.infile, "rb").read()
+        env = pq.seal_pq(data, ident, *rec)
+        with open(args.outfile, "wb") as f:
+            f.write(env)
+        print(f"pq-sealed {args.infile} -> {args.outfile} ({len(env)}B, X25519+ML-KEM-768)")
+
+    elif args.cmd == "pqunseal":
+        from . import pq
+        ident = pq.PQIdentity.load(args.my_id)
+        snd = pq.PQIdentity.parse_public(open(args.from_pub).read().strip())
+        env = open(args.infile, "rb").read()
+        try:
+            plain = pq.open_pq(env, ident, snd[0], snd[1])
+        except Exception as e:
+            sys.exit(f"pq-unseal failed: {e}")
+        with open(args.outfile, "wb") as f:
+            f.write(plain)
+        print(f"pq-unsealed -> {args.outfile} ({len(plain)}B, signature verified)")
 
     elif args.cmd == "send":
         print(transfer.send_file(args.file, args.host, args.port, args.keyfile))
