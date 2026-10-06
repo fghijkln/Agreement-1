@@ -241,6 +241,25 @@ class RatchetSession:
 
     # ---------- 收发 ----------
 
+    def _snapshot(self) -> tuple:
+        """捕获可变状态（供认证失败时回滚）。
+
+        安全要求（Signal spec）：任何未经认证的输入都不得永久改变
+        会话状态——否则攻击者一个垃圾包即可 DoS（状态被污染后，
+        对端合法消息再也解不开）。decrypt 先在快照上推进，AEAD 成功
+        才提交。
+        """
+        return (self._root_key, self._send_ck, self._recv_ck,
+                self._send_n, self._recv_n, self._prev_send_len,
+                self._dh_self, self._dh_self_pub, self._dh_remote_pub,
+                dict(self._skipped))
+
+    def _restore(self, snap: tuple) -> None:
+        (self._root_key, self._send_ck, self._recv_ck,
+         self._send_n, self._recv_n, self._prev_send_len,
+         self._dh_self, self._dh_self_pub, self._dh_remote_pub,
+         self._skipped) = snap
+
     def _recv_step(self, remote_pub: bytes, prev_len: int):
         """收到对方新 ratchet 公钥：接收链 DH step。"""
         assert self._dh_self is not None, "session not established"
@@ -262,8 +281,16 @@ class RatchetSession:
         self._send_n = 0
 
     def _skip_to(self, ratchet_pub: bytes, until: int):
+        """推进收链到 until，中间消息密钥存入 skipped。
+
+        上限 MAX_SKIP：until 来自报文头（未认证的 uint32），必须与
+        msg_no 跳跃同样受限，否则攻击者可构造 prev_len=0xffffffff
+        诱发数十亿次 KDF（资源耗尽 DoS）。
+        """
         if self._recv_ck is None:
             return
+        if until - self._recv_n > MAX_SKIP:
+            raise ValueError("too many skipped messages")
         while self._recv_n < until:
             self._recv_ck, mk = _kdf_ck(self._recv_ck)
             self._skipped[(ratchet_pub, self._recv_n)] = mk
@@ -285,7 +312,13 @@ class RatchetSession:
         return hdr + nonce + ct
 
     def decrypt(self, blob: bytes) -> bytes:
-        """解密一条消息（容忍乱序，skipped 键上限 MAX_SKIP）。"""
+        """解密一条消息（容忍乱序，skipped 键上限 MAX_SKIP）。
+
+        事务式状态更新（Signal spec："如果消息认证失败，对 state 的
+        修改必须被丢弃"）：ratchet 推进全部发生在快照上，AEAD 认证
+        成功才提交；失败则回滚——攻击者伪造/篡改的报文无法污染会话
+        状态，后续合法消息不受影响。
+        """
         if not self._established:
             raise RuntimeError("session not established")
         if len(blob) < HEADER_SIZE + NONCE_SIZE + 16:
@@ -296,26 +329,37 @@ class RatchetSession:
         ratchet_pub, prev_len, msg_no = unpack_header(hdr)
         aad = MAGIC_RATCHET + hdr
 
-        # 1) skipped 命中（乱序补上，密钥用后即焚）
-        mk = self._skipped.pop((ratchet_pub, msg_no), None)
-        if mk is not None:
-            return ChaCha20Poly1305(mk).decrypt(nonce, ct, aad)
+        snap = self._snapshot()
+        try:
+            # 1) skipped 命中（乱序补上）——pop 只发生在快照副本上，
+            #    认证失败时副本丢弃，密钥不丢：篡改的乱序消息无法
+            #    永久毁掉真正的消息（④ 的修复）
+            skipped = dict(self._skipped)
+            mk = skipped.pop((ratchet_pub, msg_no), None)
+            if mk is not None:
+                pt = ChaCha20Poly1305(mk).decrypt(nonce, ct, aad)
+                self._skipped = skipped
+                return pt
 
-        # 2) 对方换了 ratchet 公钥 → 接收链 DH step
-        if ratchet_pub != self._dh_remote_pub:
-            self._recv_step(ratchet_pub, prev_len)
+            # 2) 对方换了 ratchet 公钥 → 接收链 DH step
+            if ratchet_pub != self._dh_remote_pub:
+                self._recv_step(ratchet_pub, prev_len)
 
-        # 3) 推进收链到 msg_no，中间密钥记为 skipped
-        if self._recv_ck is None:
-            raise ValueError("no receiving chain")
-        if msg_no < self._recv_n:
-            raise ValueError("message already processed")
-        if msg_no - self._recv_n > MAX_SKIP:
-            raise ValueError("too many skipped messages")
-        self._skip_to(ratchet_pub, msg_no)
-        self._recv_ck, mk = _kdf_ck(self._recv_ck)
-        self._recv_n += 1
-        return ChaCha20Poly1305(mk).decrypt(nonce, ct, aad)
+            # 3) 推进收链到 msg_no，中间密钥记为 skipped
+            if self._recv_ck is None:
+                raise ValueError("no receiving chain")
+            if msg_no < self._recv_n:
+                raise ValueError("message already processed")
+            if msg_no - self._recv_n > MAX_SKIP:
+                raise ValueError("too many skipped messages")
+            self._skip_to(ratchet_pub, msg_no)
+            self._recv_ck, mk = _kdf_ck(self._recv_ck)
+            self._recv_n += 1
+            pt = ChaCha20Poly1305(mk).decrypt(nonce, ct, aad)
+            return pt
+        except Exception:
+            self._restore(snap)      # 认证失败：状态原子回滚（①③ 的修复）
+            raise
 
     @property
     def send_ratchet_pub(self) -> bytes:
