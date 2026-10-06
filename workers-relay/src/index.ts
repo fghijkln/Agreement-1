@@ -12,9 +12,9 @@
  *
  * 端点不可见数据：正文、文件名、时间戳（全在加密体内）。
  */
-import { NbxFpDurableObject } from "./do";
+import { NbxFpDurableObject, RegistryDo } from "./do";
 
-export { NbxFpDurableObject };
+export { NbxFpDurableObject, RegistryDo };
 
 const TTL_MS = 7 * 86400 * 1000;        // 信封保存 7 天
 const MAX_PER_FP = 256;                  // 每指纹队列上限
@@ -127,6 +127,16 @@ export default {
       if (!ok) return json(403, { ok: false, error: "bad signature" });
       const fp = new Uint8Array(
         await crypto.subtle.digest("SHA-256", pubMaterial as BufferSource)).slice(0, 8);
+      // audit R-10: 全局登记闸门 —— 无限造身份会创建无限 DO 实例。
+      // REGISTRY DO（单例 idFromName("registry")）对新 fp 做计数上限；
+      // 已登记的 fp 重放 AUTH 不占新名额（fp 已在 set 里则直接放行）。
+      {
+        const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
+        const regResp = await regStub.fetch("https://registry/claim", {
+          method: "POST", body: b64urlEncode(fp),
+        });
+        if (!regResp.ok) return json(429, { ok: false, error: "registration quota exhausted" });
+      }
       const id = env.NBX_FP.idFromName(b64urlEncode(fp));
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pubkey", {
@@ -168,6 +178,9 @@ export default {
           body.slice(0, 48), tsBytes);
         if (!await ed25519Verify(senderEd, sigBytes, msgBytes))
           return json(403, { ok: false, error: "bad sender proof" });
+        // audit R-10: per-sender 投递配额 —— 认证发送者也不能高频灌信封
+        const quotaResp = await senderStub.fetch("https://do/send_quota", { method: "POST" });
+        if (!quotaResp.ok) return json(429, { ok: false, error: "sender quota exceeded" });
       }
       // 入队存裸信封（不带投递签名后缀），收件方无需感知
       const id = env.NBX_FP.idFromName(b64urlEncode(hdr.recvFp));
@@ -208,4 +221,5 @@ export default {
 
 export interface Env {
   NBX_FP: DurableObjectNamespace;
+  NBX_REGISTRY: DurableObjectNamespace;   // audit R-10: 全局登记闸门
 }

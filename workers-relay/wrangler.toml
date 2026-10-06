@@ -6,6 +6,15 @@ compatibility_date = "2024-09-01"
 name = "NBX_FP"
 class_name = "NbxFpDurableObject"
 
+# audit R-10: 全局登记闸门（单例 DO），限制无限造身份 → 无限 DO 实例
+[[durable_objects.bindings]]
+name = "NBX_REGISTRY"
+class_name = "RegistryDo"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NbxFpDurableObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RegistryDo"]

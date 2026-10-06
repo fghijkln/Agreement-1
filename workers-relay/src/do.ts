@@ -5,6 +5,9 @@
  */
 const TTL_MS = 7 * 86400 * 1000;
 const MAX_PER_FP = 256;
+const MAX_REGISTERED = 10000;            // audit R-10: 全局登记公钥上限
+const SEND_QUOTA_WINDOW_MS = 3600 * 1000;// audit R-10: per-sender 投递配额窗口
+const SEND_QUOTA_MAX = 600;              // 每发送者每小时最多投递数
 const MAGIC_MSG = new Uint8Array([0x4e, 0x42, 0x58, 0x4d, 0x53, 0x47, 0x01, 0x00]);
 
 function b64urlEncode(buf: Uint8Array): string {
@@ -51,7 +54,20 @@ export class NbxFpDurableObject {
         if (old !== neu) return json(409, { ok: false, error: "fingerprint already bound to another key" });
         return json(200, { ok: true });
       }
+      // audit R-10: 全局登记上限由 worker 侧 REGISTRY DO 把关（见 index.ts /auth）
       await this.state.storage.put("pubkey", pubRaw);
+      return json(200, { ok: true });
+    }
+
+    // audit R-10: per-sender 投递配额（滑动窗口计数）
+    if (req.method === "POST" && path === "/send_quota") {
+      const now = Date.now();
+      const times = ((await this.state.storage.get<number[]>("send_times")) ?? [])
+        .filter((t) => now - t < SEND_QUOTA_WINDOW_MS);
+      if (times.length >= SEND_QUOTA_MAX)
+        return json(429, { ok: false, error: "sender quota exceeded" });
+      times.push(now);
+      await this.state.storage.put("send_times", times);
       return json(200, { ok: true });
     }
 
@@ -86,6 +102,34 @@ export class NbxFpDurableObject {
       return json(200, { ok: true, envelopes: q.map((e) => e.env) });
     }
 
+    return json(404, { ok: false, error: "not found" });
+  }
+}
+
+/**
+ * RegistryDo — 全局单例（idFromName("registry")），audit R-10 的登记闸门。
+ * 记录已登记 fp 集合；超过 MAX_REGISTERED 拒绝新登记（幂等：已存在的 fp 放行）。
+ * 存储为分片 map（fp -> 1），数量 = keys 数（DO 单实例强一致）。
+ */
+export class RegistryDo {
+  private state: DurableObjectState;
+
+  constructor(state: DurableObjectState, _env: unknown) {
+    this.state = state;
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const path = new URL(req.url).pathname;
+    if (req.method === "POST" && path === "/claim") {
+      const fp = new Uint8Array(await req.arrayBuffer()).toString();
+      const existing = await this.state.storage.get<number>("fp:" + fp);
+      if (existing) return json(200, { ok: true, existing: true });
+      const count = (await this.state.storage.get<number>("count")) ?? 0;
+      if (count >= MAX_REGISTERED) return json(429, { ok: false, error: "registration quota exhausted" });
+      await this.state.storage.put("fp:" + fp, 1);
+      await this.state.storage.put("count", count + 1);
+      return json(200, { ok: true, existing: false });
+    }
     return json(404, { ok: false, error: "not found" });
   }
 }
