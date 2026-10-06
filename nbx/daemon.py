@@ -139,11 +139,17 @@ class ContactSession:
 
 
 
-def _progress_of(session) -> int:
-    """audit R2-04: 会话进度标量。非 RatchetSession（测试 stub）按 0 处理。"""
-    recv_n = getattr(session, "recv_n", 0)
-    send_n = getattr(session, "send_n", 0)
-    return recv_n * (1 << 20) + send_n
+def _progress_of(session) -> tuple[int, int]:
+    """audit R2-04/R2-05: 会话进度为 (recv_n, send_n) 有序元组。
+
+    元组按字典序比较，无标量编码的权重碰撞问题（旧实现
+    recv_n * 2**20 + send_n 在 send_n 无 2**20 上限不变量时，
+    recv_n 更旧但 send_n 更大的状态可绕过回滚检查）。
+    非 RatchetSession（测试 stub）按 (0, 0) 处理。
+    """
+    recv_n = int(getattr(session, "recv_n", 0) or 0)
+    send_n = int(getattr(session, "send_n", 0) or 0)
+    return (recv_n, send_n)
 
 class Daemon:
     """常驻会话服务。UI 通过 IPC 与之通信，daemon 独立生命周期。"""
@@ -221,6 +227,20 @@ class Daemon:
         """audit R2-04: 只追加的单调 epoch 日志（每对端一个）。"""
         return self.state_dir / "sessions" / f"{_b64e(peer_fp)}.epoch"
 
+    @staticmethod
+    def _parse_epoch_lines(text: str) -> list[tuple[int, tuple[int, int]]]:
+        """解析 epoch 日志行: "ts recv send"，坏行跳过。"""
+        out = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 3:
+                try:
+                    out.append((int(parts[0]),
+                                (int(parts[1]), int(parts[2]))))
+                except ValueError:
+                    continue
+        return out
+
     def save_session(self, cs: ContactSession) -> None:
         if cs.session is None:
             return
@@ -229,13 +249,26 @@ class Daemon:
         tmp.write_bytes(blob)
         os.replace(tmp, self._session_path(cs))
         os.chmod(self._session_path(cs), 0o600)
-        # audit R2-04: 回滚防护 —— 把当前进度追加到 append-only epoch 日志。
-        # 日志与状态文件分离；攻击者把状态文件滚回旧版后，epoch 日志里
-        # 记录的更大进度仍在（普通文件替换无法回退 append-only 日志内容）。
-        progress = (_progress_of(cs.session))
-        with open(self._epoch_log_path(cs.peer_fp), "a") as f:
-            f.write(f"{int(time.time())} {progress}\n")
-        os.chmod(self._epoch_log_path(cs.peer_fp), 0o600)
+        # audit R2-04/R2-06: 回滚检测基线。日志与状态文件分离，程序自身
+        # 只以 append 模式写；进度单调时旧条目不再需要，压实时可截断。
+        # 边界声明（R2-06）: 这防的是"只滚 state 文件"的场景——若攻击
+        # 者/备份还原连整个 sessions 目录一起回滚，两者一致地变旧，
+        # 本机制不提供保护（那需要外部锚点，见审计记录）。
+        recv_n, send_n = _progress_of(cs.session)
+        ep = self._epoch_log_path(cs.peer_fp)
+        with open(ep, "a") as f:
+            f.write(f"{int(time.time())} {recv_n} {send_n}\n")
+        os.chmod(ep, 0o600)
+        # audit R2-07: 压实——日志超过阈值行数时截断为单行当前值，
+        # 避免 load 时全文件扫描随保存次数无界增长。
+        with open(ep) as f:
+            entries = self._parse_epoch_lines(f.read())
+        if len(entries) >= 64:
+            last_ts, (lr, ls) = max(entries, key=lambda e: (e[1], e[0]))
+            tmp = ep.with_suffix(".tmp")
+            tmp.write_text(f"{last_ts} {lr} {ls}\n")
+            os.replace(tmp, ep)
+            os.chmod(ep, 0o600)
 
     def load_session(self, cs: ContactSession) -> None:
         p = self._session_path(cs)
@@ -243,26 +276,23 @@ class Daemon:
             return
         rs = RatchetSession()
         rs.import_state(p.read_bytes())
-        # audit R2-04: 拒绝加载进度落后于 epoch 日志的状态（检测回滚）。
-        # 允许相等（正常重启）。epoch 日志缺失（旧版本升级）则跳过。
+        # audit R2-04/R2-05: 拒绝加载进度落后于 epoch 日志的状态。
+        # 进度为 (recv_n, send_n) 元组按字典序比较（R2-05: 不得用
+        # 加权标量冒充）。允许相等（正常重启）；无日志（旧版本升级）
+        # 则跳过。
         ep = self._epoch_log_path(cs.peer_fp)
         if ep.exists():
-            last = 0
             with open(ep) as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) == 2:
-                        try:
-                            last = max(last, int(parts[1]))
-                        except ValueError:
-                            continue
-            progress = _progress_of(rs)
-            if progress < last:
-                raise RuntimeError(
-                    f"session state rollback detected for peer "
-                    f"{_b64e(cs.peer_fp)}: state progress {progress} < "
-                    f"epoch log {last} — refusing to load (possible "
-                    f"restore attack; delete BOTH files to reset)")
+                entries = self._parse_epoch_lines(f.read())
+            if entries:
+                _, last = max(entries, key=lambda e: (e[1], e[0]))
+                progress = _progress_of(rs)
+                if progress < last:
+                    raise RuntimeError(
+                        f"session state rollback detected for peer "
+                        f"{_b64e(cs.peer_fp)}: state progress {progress} < "
+                        f"epoch log {last} — refusing to load (possible "
+                        f"restore attack; delete BOTH files to reset)")
         cs.session = rs
 
     def log_message(self, direction: str, peer_fp: bytes, text: str) -> None:

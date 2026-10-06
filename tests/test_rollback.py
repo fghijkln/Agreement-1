@@ -1,4 +1,4 @@
-"""audit R2-04 回归：ratchet 状态回滚检测（daemon 层 monotonic epoch）。"""
+"""audit R2-04/05/06/07 回归：ratchet 状态回滚检测（daemon 层 monotonic epoch）。"""
 import pytest
 
 from nbx import fskey
@@ -39,8 +39,9 @@ def test_integrity_tag_with_skipped_entries_roundtrip():
     assert again.decrypt(ct) == b"after-save"
 
 
-def _progress(sess: RatchetSession) -> int:
-    return sess.recv_n * (1 << 20) + sess.send_n
+def _progress(sess):
+    from nbx.daemon import _progress_of
+    return _progress_of(sess)
 
 
 def test_rollback_detected_on_state_file_swap(tmp_path):
@@ -94,3 +95,68 @@ def test_no_epoch_log_legacy_upgrade(tmp_path):
     da.load_session(cs2)
     assert cs2.session is not None
     print("✓ R2-04: 旧版本（无 epoch 日志）兼容")
+
+
+def test_r2_05_tuple_beats_scalar_collision(tmp_path):
+    """R2-05: recv_n 更旧但 send_n 更大的状态不得绕过回滚检查。
+
+    旧标量 recv_n*2^20+send_n 下, (4, 1500000) > (5, 0) 会被放行;
+    元组字典序 (4,*) < (5,*) 必须拒绝。
+    """
+    from nbx.daemon import _progress_of
+
+    class _Fake:
+        recv_n = 4
+        send_n = 1_500_000
+
+    assert _progress_of(_Fake()) < (5, 0), "元组序必须判 (4,1500000) < (5,0)"
+    # 旧标量判反——证明本回归针对的碰撞真实存在:
+    assert 4 * (1 << 20) + 1_500_000 > 5 * (1 << 20) + 0
+    print("R2-05 ok: (recv_n, send_n) 元组序修复标量碰撞")
+
+
+def test_r2_05_rollback_with_stale_recv(tmp_path):
+    """R2-05 端到端: recv/send 组合落后于日志的状态文件仍被拒。"""
+    da = Daemon(str(tmp_path / "state-a"), "https://relay.example")
+    peer_pub = fskey.Identity.generate().export_public()
+    cs = da.add_contact(peer_pub)
+    sess, _ = _established_pair()
+    cs.session = sess
+    sess.encrypt(b"x")                    # 推进 send_n 至 (0,1)
+    da.save_session(cs)                   # epoch 记 (0,1)
+    # 状态文件滚回 (0,0) 的快照
+    sess0, _ = _established_pair()
+    da._session_path(cs).write_bytes(sess0.export_state())
+    da.contacts.clear()
+    cs2 = da.add_contact(peer_pub)
+    with pytest.raises(RuntimeError, match="rollback"):
+        da.load_session(cs2)
+    print("R2-05 ok: 端到端拦截 (0,0) < (0,1)")
+
+
+def test_r2_07_epoch_log_compaction(tmp_path):
+    """R2-07: epoch 日志超过阈值自动压实, 不无限增长。"""
+    da = Daemon(str(tmp_path / "state-a"), "https://relay.example")
+    peer_pub = fskey.Identity.generate().export_public()
+    cs = da.add_contact(peer_pub)
+    sess, _ = _established_pair()
+    cs.session = sess
+    for i in range(80):
+        da.save_session(cs)               # 每次追加; 超过 64 触发压实
+    ep = da._epoch_log_path(cs.peer_fp)
+    lines = [l for l in ep.read_text().splitlines() if l.strip()]
+    assert len(lines) < 64, f"压实失败: {len(lines)} 行"
+    da.contacts.clear()
+    cs2 = da.add_contact(peer_pub)
+    da.load_session(cs2)
+    assert cs2.session is not None
+    print(f"R2-07 ok: 压实后剩 {len(lines)} 行, 加载正常")
+
+
+def test_r2_06_boundary_documented():
+    """R2-06: 代码明确声明 epoch 防护边界（不夸大 append-only）。"""
+    import inspect
+    from nbx.daemon import Daemon
+    src = inspect.getsource(Daemon.save_session)
+    assert "不提供保护" in src
+    print("R2-06 ok: 边界声明在代码中")
