@@ -59,6 +59,23 @@ def main(argv=None):
     bdl.add_argument("outfile")
     bdl.add_argument("infiles", nargs="+")
 
+    idn = sub.add_parser("identity", help="前向保密身份密钥管理")
+    idn.add_argument("action", choices=["new", "show", "pubout"])
+    idn.add_argument("idfile", nargs="?", default="nbx_id.key")
+    idn.add_argument("--out", default=None, help="pubout 时导出公钥到的文件")
+
+    fs = sub.add_parser("seal", help="前向保密加密（X25519+Ed25519 信封）")
+    fs.add_argument("infile")
+    fs.add_argument("outfile")
+    fs.add_argument("--my-id", default="nbx_id.key")
+    fs.add_argument("--to-pub", required=True, help="接收方身份公钥文件(Base64)")
+
+    un = sub.add_parser("unseal", help="解密前向保密信封")
+    un.add_argument("infile")
+    un.add_argument("outfile")
+    un.add_argument("--my-id", default="nbx_id.key")
+    un.add_argument("--from-pub", required=True, help="发送方身份公钥文件(Base64)")
+
     args = p.parse_args(argv)
 
     if args.cmd == "keygen":
@@ -153,6 +170,51 @@ def main(argv=None):
         with open(args.outfile, "wb") as f:
             f.write(blob)
         print(f"bundled {len(args.infiles)} files -> {args.outfile} ({len(blob)} bytes)")
+
+    elif args.cmd == "identity":
+        from . import fskey
+        import os
+        if args.action == "new":
+            if os.path.exists(args.idfile):
+                sys.exit(f"refusing to overwrite existing identity: {args.idfile}")
+            ident = fskey.Identity.generate()
+            ident.save(args.idfile)
+            print(f"identity created: {args.idfile}")
+            print(f"fingerprint: {ident.fingerprint()}")
+            print(f"public key:\n{ident.export_public()}")
+        elif args.action == "show":
+            ident = fskey.Identity.load(args.idfile)
+            print(f"fingerprint: {ident.fingerprint()}")
+            print(f"public key:\n{ident.export_public()}")
+        elif args.action == "pubout":
+            ident = fskey.Identity.load(args.idfile)
+            out = args.out or (args.idfile + ".pub")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(ident.export_public() + "\n")
+            print(f"public key written to {out}")
+
+    elif args.cmd == "seal":
+        from . import fskey
+        ident = fskey.Identity.load(args.my_id)
+        to_x, to_ed = fskey.Identity.parse_public(open(args.to_pub).read().strip())
+        data = open(args.infile, "rb").read()
+        env = fskey.seal_envelope(data, ident, to_x, to_ed)
+        with open(args.outfile, "wb") as f:
+            f.write(env)
+        print(f"sealed {args.infile} -> {args.outfile} ({len(env)} bytes, forward-secure)")
+
+    elif args.cmd == "unseal":
+        from . import fskey
+        ident = fskey.Identity.load(args.my_id)
+        from_x, from_ed = fskey.Identity.parse_public(open(args.from_pub).read().strip())
+        env = open(args.infile, "rb").read()
+        try:
+            plain = fskey.open_envelope(env, ident, from_x, from_ed)
+        except Exception as e:
+            sys.exit(f"unseal failed (wrong key or tampered): {e}")
+        with open(args.outfile, "wb") as f:
+            f.write(plain)
+        print(f"unsealed -> {args.outfile} ({len(plain)} bytes, signature verified)")
 
     elif args.cmd == "send":
         print(transfer.send_file(args.file, args.host, args.port, args.keyfile))
