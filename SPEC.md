@@ -348,7 +348,104 @@ TEXT/READ/FILE_* 的明文用小型 TLV：`type(1, LE u8) || len(4, LE u32) || v
 | 5 | SHA-256 (32B) |
 | 6 | 分块偏移 (LE u64) |
 
-## 9. 威胁模型与边界
+## 9. 中继服务器（nbx/relay.py, workers-relay/）
+
+IM 消息的离线投递通道。服务器是密文搬运工：只解析明文头（10.1 的 48 字节）做路由，正文永远不可见，取走即清、不留历史。
+
+### 9.1 双部署形态
+
+| | Python（nbx/relay.py） | Workers（workers-relay/） |
+|---|---|---|
+| 运行环境 | 任意 VPS / 本机，stdlib http.server | Cloudflare Workers + Durable Objects |
+| 存储 | MemoryStore（可换 SQLite） | 每 指纹一个 DO 实例（idFromName），强一致 |
+| 验签 | cryptography Ed25519 | WebCrypto crypto.subtle Ed25519（原生，无需 WASM） |
+| 部署 | `python -m nbx.cli relay --port 8765` | `cd workers-relay && npx wrangler deploy` |
+
+两形态共享同一字节协议，客户端可混用（Python 端点连 Workers 中继已互操作实测）。DO 侧对同一指纹的并发读写串行化，规避 4.5 节提到的缓存竞态。
+
+### 9.2 参数（两形态一致）
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 信封 TTL | 7 天（604800s） | 入队时打时间戳，超时清理 |
+| 每指纹队列上限 | 256 条 | 满则丢最旧 |
+| 单信封上限 | 1 MiB | 大文件走 FILE_OFFER + 分块，多信封传 |
+| 时间窗 | ±300s | /auth 与取信 proof 共用 |
+
+### 9.3 端点
+
+```
+POST /envelope          body = 完整消息信封（明文头 + 加密体）
+  校验: 长度 ≤ 1MiB、魔数、版本、body 长度一致、ptype ≠ 0、sender_fp ≠ recv_fp
+  202 {ok, msg_id(b64url)}   400 {ok:false, error}
+
+POST /auth              body = fp(8) || ts(8, LE u64) || ed_pub(32) || sig(64)
+  sig = Ed25519_sign(ed_pub 私钥, "nbx-relay-auth-v1" || fp || ts)
+  TOFU：指纹首次登记绑定公钥；重复登记同钥 200，换绑 409
+  200 / 400（长度、时间窗）/ 403（坏签名）/ 409（换绑）
+
+GET /inbox/<fp_b64url>?proof=<b64url>
+  proof = ts(8) || sig(64)，sig = Ed25519_sign(登记的私钥, AUTH_INFO || fp || ts)
+  授权通过 → 取走该指纹全部信封并清空（取走即清）
+  200 {ok, envelopes:[b64url]}   403（未登记/错钥/超窗）   400
+
+GET /health             200 {ok:true}
+```
+
+### 9.4 服务器威胁模型边界
+
+- 服务器可见：收发双方指纹、消息类型、投递时间、信封大小、频率。想隐藏大小用 5 节 AW 填充；想隐藏与服务器的关系用 10 节 L2。
+- 服务器不可见：正文、文件名、会话上下文、ratchet 状态。
+- 恶意服务器：可以丢信（可用性攻击，协议无法防）、延迟投递；不能篡改（AEAD）、不能重放成功（4.5 + 7.4 双层）、不能伪造发件人（Ed25519）。
+- 信任模型：TOFU。/auth 首次绑定后换绑被拒（409），但首次绑定时若中间人抢先登记，服务器无法区分——身份真实性最终靠带外指纹核对（4.2）。
+
+## 10. 会话持久化与三层传输栈（nbx/contacts.py）
+
+### 10.1 ratchet 会话状态序列化
+
+```
+blob = base64( MAGIC_STATE(11, "NBXRATCHST1") || ver(1) || TLV fields )
+TLV: type(1) || len(4, LE u32) || value
+  1 root_key(32)       2 send_ck(32 或空)   3 recv_ck(32 或空)
+  4 dh_self_priv(32)   5 dh_remote_pub(32)  6 skipped entries
+  7 counters: prev_send_len(4) || send_n(4) || recv_n(4)，各 LE u32
+skipped entry: ratchet_pub(32) || msg_no(4, LE) || message_key(32)
+```
+
+恢复后通信无缝继续，含乱序场景：skipped 键跨进程保留，"消息 2 已解、重启、消息 1 后到"仍可解（实测）。状态含 ratchet 私钥，敏感级别等同身份私钥，落盘必须加密（可用 5 节 AW）。
+
+### 10.2 通讯录
+
+联系人 = 身份公钥材料（Base64）+ 最近会话状态 + 候选地址表 + 降级顺序：
+
+```json
+{ "<fp_b32>": {
+    "pub": "<b64 身份公钥>",
+    "session": "<ratchet export_state>",
+    "addrs": [{"layer": 1, "addr": "192.168.1.5:8765", "ts": 0},
+              {"layer": 2, "addr": "xxx.onion:8765"},
+              {"layer": 3, "addr": "https://relay.example"}],
+    "pref": [1, 2, 3] } }
+```
+
+`pref` 可配：隐私优先 `[2,3]`（永不经 L1 直连，防真实 IP 关联）；延迟优先 `[1,3]`。地址表由握手消息交换（M2.5c 起自动填 L1 候选），成功投递的地址记录 `last_ok` 时间。
+
+### 10.3 三层传输
+
+```
+应用层 → TransportStack.send(fp, blob)
+  L1 P2P 直连    TCP 直连对端 mini-relay（同 relay 协议）；UDP 打洞在 M2.5c
+  L2 匿名网络    SOCKS5（Tor 9050）→ onion:port 上的 relay 协议；I2P 同构
+  L3 中继        relay HTTP（9.3），首次自动 /auth
+按 pref 顺序逐层逐地址尝试，成功即返回 (layer, result) 并记录；全部失败返回 -1。
+poll() 反向：从所有标记 last_ok 的地址取自己的桶。
+```
+
+三层跑的是同一个应用层协议（8 节消息信封），区别只在把字节塞进哪个管道。部署推论：一台 onion 服务或一个 Workers 实例都是"L3 的一种地址"，客户端无需区分对待。
+
+边界：L1 的 P2P 直连地址会暴露本机网络位置（NAT 后的局域网地址无害，公网映射地址敏感）；L2 依赖本机 Tor/I2P 进程，等于把匿名性外包给覆盖网络的规模与配置；三层都不防本机被入侵。
+
+## 11. 威胁模型与边界
 
 | 对手 | 防护 |
 |------|------|
@@ -361,10 +458,13 @@ TEXT/READ/FILE_* 的明文用小型 TLV：`type(1, LE u8) || len(4, LE u32) || v
 | 收方主动泄露 | 无法防护 |
 | 重放（重发旧信封） | 信封级：时间窗（±300s）+ 信封 ID 缓存（4.5 节）；消息级：链序号 + skipped 缓存（7.4 节） |
 | 会话链被攻破 | Double Ratchet：下一次 DH 轮换引入新鲜 DH 输出，链自愈（7.5 节） |
+| 网络审查 / 隐藏服务器位置 | L2 匿名网络：onion/destination 地址不可关联真实 IP（10.3 节） |
+| 中继作恶（丢信/拖延） | 可用性攻击，协议无法防；可换中继或走 L1/L2 |
+| 中继作恶（篡改/伪造/重放） | AEAD + Ed25519 + 双层重放防护，服务器无法绕过（9.4 节） |
 
-已知边界：TLS 层缺失——帧层裸奔在 TCP 上，依赖层级 4 提供机密性；时序侧信道——ML-KEM-768 使用 vendored 纯 Python 实现（kyber-py），非常时实现，解封耗时可能侧漏信息，本协议按"无物理旁路、非实时"对手建模，高对抗部署应换用常时（constant-time）KEM 实现或 liboqs；会话密钥协商层（7 节 Double Ratchet）的 DH step 仍为 X25519，不含后量子成分，抗量子的存档攻击需在信封层（4.3 PQ 混合）实现；ratchet 会话状态仅存内存，进程重启后需重新握手。
+已知边界：TLS 层缺失——帧层裸奔在 TCP 上，依赖层级 4 提供机密性；时序侧信道——ML-KEM-768 使用 vendored 纯 Python 实现（kyber-py），非常时实现，解封耗时可能侧漏信息，本协议按"无物理旁路、非实时"对手建模，高对抗部署应换用常时（constant-time）KEM 实现或 liboqs；会话密钥协商层（7 节 Double Ratchet）的 DH step 仍为 X25519，不含后量子成分，抗量子的存档攻击需在信封层（4.3 PQ 混合）实现；ratchet 会话状态含 ratchet 私钥，导出/落盘时敏感级别等同身份私钥，必须加密存储（10.1 节）；中继服务器可丢弃信封（可用性攻击，9.4 节）；会话状态仅在内存时进程重启丢失，持久化依赖 10.1 节且落盘须加密。
 
-## 10. CLI 一览
+## 12. CLI 一览
 
 ```
 nbx keygen / pack / unpack          主密钥模式
@@ -375,4 +475,7 @@ nbx seal / unseal                   FS 信封
 nbx pqseal / pqunseal               PQ 混合信封
 nbx anon pack|unpack                匿名包装
 nbx send / listen                   分块传输（强制 E2E）
+nbx relay --port                    启动中继服务器
+nbx chat --my-id --to-pub           经中继的加密会话客户端
+workers-relay/ (npx wrangler deploy)  Cloudflare Workers 版中继
 ```

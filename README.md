@@ -71,6 +71,9 @@ nbx/
 ├── fskey.py       FS 信封：X25519 临时 + Ed25519 签名
 ├── pq/            PQ 混合信封：+ ML-KEM-768（vendored kyber-py）
 ├── anon.py        Anonymity Wrapper：元数据加密 + 长度填充
+├── relay.py       中继服务器：分桶队列/TTL/取走即清/TOFU 授权
+├── contacts.py    通讯录 + 三层传输栈（P2P/匿名网络/中继）
+├── chat.py        经中继的加密会话客户端
 ├── replay.py      重放防护：时间窗 + 信封 ID 持久缓存
 ├── ratchet.py     Double Ratchet 会话：逐消息前向保密、DH 轮换、乱序容忍
 ├── message.py     IM 消息信封：9 种负载类型，正文全在加密体
@@ -88,7 +91,32 @@ python3 tests/test_fskey.py      # FS：冒充拒绝、篡改拒绝、前向保�
 python3 tests/test_pq_anon.py    # PQ 混合、KEM 随机性、匿名包装、E2E 强制
 python3 tests/test_replay.py     # 重放防护：时间窗、缓存持久化、旧攻击面回归
 python3 tests/test_ratchet.py    # ratchet：前向保密、乱序、重放、文件分块、FS 完整栈
+python3 tests/test_relay.py      # 中继：投递校验、TTL、TOFU、HTTP、端到端
+python3 tests/test_transport.py  # 传输栈：会话持久化、降级、通讯录
 ```
+
+## 中继服务器与三种部署形态
+
+IM 消息的离线投递由中继完成——服务器只看 48 字节明文路由头，正文永远在加密体里，取走即清不留历史。同一协议三种跑法：
+
+```bash
+python -m nbx.cli relay --port 8765           # 自建（VPS/本机）
+cd workers-relay && npx wrangler deploy       # Cloudflare Workers + Durable Objects
+tor onion service 指向任意上述实例             # 匿名部署，地址不可关联真实 IP
+```
+
+参数一致：信封保存 7 天、每收件人队列上限 256、单信封 1 MiB、时间窗 ±300s。Python 客户端连 Workers 中继已互操作实测。
+
+## 三层传输栈
+
+```
+应用层 → TransportStack.send(联系人, 消息)
+  L1  P2P 直连     局域网/打洞后的直连（最低延迟）
+  L2  匿名网络     Tor/I2P 上的中继（无公网 IP 也可收发，IP 不可关联）
+  L3  中继服务器   自建或 Workers（保底，永远可达）
+```
+
+按每个联系人的偏好顺序自动降级（隐私优先 `[2,3]`、延迟优先 `[1,3]`），成功层自动记录。会话状态可导出恢复——重启后不用重新握手，乱序消息跨重启仍可解。
 
 ## IM 会话（Double Ratchet）
 
