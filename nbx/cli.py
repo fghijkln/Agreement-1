@@ -38,6 +38,21 @@ def main(argv=None):
     l.add_argument("--outdir", default="received")
     l.add_argument("--keyfile", default="nbx.key")
 
+    cv = sub.add_parser("convert", help="把任意文件转成 .nbx 通用载体")
+    cv.add_argument("infile")
+    cv.add_argument("outfile")
+    cv.add_argument("--encrypt", action="store_true", help="同时加密")
+    cv.add_argument("--keyfile", default="nbx.key")
+
+    ex = sub.add_parser("extract", help="从 .nbx 无损还原原文件")
+    ex.add_argument("infile")
+    ex.add_argument("--outdir", default=".")
+    ex.add_argument("--keyfile", default="nbx.key")
+
+    bdl = sub.add_parser("bundle", help="把多个文件打成一个 .nbx")
+    bdl.add_argument("outfile")
+    bdl.add_argument("infiles", nargs="+")
+
     args = p.parse_args(argv)
 
     if args.cmd == "keygen":
@@ -65,6 +80,59 @@ def main(argv=None):
         with open(args.outfile, "wb") as f:
             f.write(plain)
         print(f"unpacked -> {args.outfile} (meta: {json.dumps(meta, ensure_ascii=False)})")
+
+    elif args.cmd == "convert":
+        from . import carrier
+        blob = carrier.convert(args.infile)
+        if args.encrypt:
+            master = _read_key(args.keyfile)
+            meta, streams, flags = carrier.unpack(blob)
+            enc = crypto.encrypt(carrier._build_payload(streams), master)
+            meta["enc"] = "chacha20poly1305"
+            blob = carrier.pack([(carrier.TLV_BIN, enc)], meta,
+                                flags=carrier.FLAG_ENCRYPTED)
+        with open(args.outfile, "wb") as f:
+            f.write(blob)
+        print(f"converted {args.infile} -> {args.outfile} ({len(blob)} bytes)")
+
+    elif args.cmd == "extract":
+        from . import carrier
+        with open(args.infile, "rb") as f:
+            blob = f.read()
+        meta, streams, flags = carrier.unpack(blob)
+        if flags & carrier.FLAG_ENCRYPTED:
+            master = _read_key(args.keyfile)
+            payload = crypto.decrypt(streams[0][1], master)
+            # 重新解析内层 TLV
+            p, inner = 0, []
+            while p < len(payload):
+                stype, slen = carrier.TLV.unpack_from(payload, p)
+                p += carrier.TLV.size
+                inner.append((stype, payload[p:p + slen]))
+                p += slen
+            streams = inner
+        import os
+        os.makedirs(args.outdir, exist_ok=True)
+        ctype = meta.get("type")
+        if ctype == "bundle" and "parts" in meta:
+            for part, (stype, content) in zip(meta["parts"], streams):
+                out = os.path.join(args.outdir, part.get("name", "part"))
+                with open(out, "wb") as f:
+                    f.write(content)
+                print(f"extracted -> {out} ({len(content)} bytes)")
+        else:
+            name = meta.get("filename", "untitled")
+            out = os.path.join(args.outdir, name)
+            with open(out, "wb") as f:
+                f.write(streams[0][1])
+            print(f"extracted -> {out} ({len(streams[0][1])} bytes, type={ctype})")
+
+    elif args.cmd == "bundle":
+        from . import carrier
+        blob = carrier.convert_bundle(args.infiles)
+        with open(args.outfile, "wb") as f:
+            f.write(blob)
+        print(f"bundled {len(args.infiles)} files -> {args.outfile} ({len(blob)} bytes)")
 
     elif args.cmd == "send":
         print(transfer.send_file(args.file, args.host, args.port, args.keyfile))
