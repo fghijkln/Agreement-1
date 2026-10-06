@@ -63,12 +63,14 @@ class MemoryStore:
 
     def __init__(self, ttl: int = DEFAULT_TTL, max_per_fp: int = DEFAULT_MAX_PER_FP,
                  max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES):
+        import threading
         self.ttl = ttl
         self.max_per_fp = max_per_fp
         self.max_total_bytes = max_total_bytes   # audit R-07：全局字节预算
         self._q: dict[bytes, list[tuple[float, bytes]]] = {}
         self._seen: dict[bytes, float] = {}     # msg_id -> 入队时间（幂等去重）
         self._total_bytes = 0
+        self._lock = threading.Lock()            # audit R-12：check+remember 原子化
 
     def _gc(self, fp: bytes):
         now = time.time()
@@ -86,22 +88,24 @@ class MemoryStore:
         中继侧只收一件——否则重复投递会让 ratchet 解密侧产生无谓的失败。
         """
         mid = envelope[:8] + hashlib.blake2b(envelope, digest_size=16).digest()
-        self._gc(recv_fp)
-        if mid in self._seen:
-            return False
-        self._seen[mid] = time.time()
-        # audit R-07：全局字节预算——"每收件人 256 条"挡不住"制造一百万
-        # 个收件人"，必须对在存总量封顶（超过时拒绝新投递，403/400 上抛）
-        if self._total_bytes + len(envelope) > self.max_total_bytes:
-            raise ValueError("global envelope budget exceeded")
-        self._total_bytes += len(envelope)
-        q = self._q.setdefault(recv_fp, [])
-        q.append((time.time(), envelope))
-        if len(q) > self.max_per_fp:            # 满了丢最旧
-            dropped = q[:-self.max_per_fp]
-            self._q[recv_fp] = q[-self.max_per_fp:]
-            for _, e in dropped:
-                self._total_bytes -= len(e)
+        with self._lock:
+            # audit R-11/R-12：check → 预算检查 → 入队 → 记账 在临界区内
+            # 原子完成（并发 worker 不会双投），且失败路径不污染 replay 状态
+            # （先记账后失败的窗口已消除——合法消息不会被判重复而丢失）。
+            self._gc(recv_fp)
+            if mid in self._seen:
+                return False
+            if self._total_bytes + len(envelope) > self.max_total_bytes:
+                raise ValueError("global envelope budget exceeded")
+            q = self._q.setdefault(recv_fp, [])
+            q.append((time.time(), envelope))
+            self._total_bytes += len(envelope)
+            self._seen[mid] = time.time()
+            if len(q) > self.max_per_fp:        # 满了丢最旧
+                dropped = q[:-self.max_per_fp]
+                self._q[recv_fp] = q[-self.max_per_fp:]
+                for _, e in dropped:
+                    self._total_bytes -= len(e)
         return True
 
     def pop_all(self, recv_fp: bytes) -> list[bytes]:
@@ -181,7 +185,10 @@ class RelayLogic:
         if verify:
             self.verify_sender(blob, len(blob))
             blob = blob[:-72]              # 入队存裸信封，收件方无感
-        self.store.put(recv_fp, blob)
+        if not self.store.put(recv_fp, blob):
+            # 重复信封（msg_id 去重命中）：幂等返回成功但不重复入队
+            return {"ok": True, "duplicate": True,
+                    "msg_id": _b64e(m["msg_id"]), "ptype": m["ptype"]}
         return {"ok": True, "msg_id": _b64e(m["msg_id"]), "ptype": m["ptype"]}
 
     # ---------- 取信 ----------

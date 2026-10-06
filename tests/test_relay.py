@@ -5,6 +5,7 @@ HTTP 状态码、以及完整链路：Alice → 中继 → Bob（离线留言场
 """
 import base64
 import json
+import pytest
 import struct
 import sys
 import threading
@@ -370,6 +371,47 @@ def test_global_envelope_budget(tmp_path):
             break
     assert accepted < 64, "全局字节预算必须封顶"
     print(f"✓ R-07：全局预算生效（{accepted}/64 封后拒绝）")
+
+
+def test_replay_processing_is_atomic(tmp_path):
+    """R-12 回归: 并发投递同一信封只入队一次 (check+remember 原子)。"""
+    logic = RelayLogic(MemoryStore())
+    sender = Identity.generate()
+    logic.register_pubkey(_raw_pub(sender))
+    bob_fp = _fp_of(Identity.generate())
+    env = _pack(msg.PT_TEXT, _fp_of(sender), bob_fp, b"once")
+    results = []
+    import threading
+    def worker():
+        for _ in range(20):
+            try:
+                results.append(logic.accept(env + _proof_of(sender, env)).get("duplicate", False))
+            except ValueError:
+                results.append("err")
+    ts = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    accepted = sum(1 for r in results if r is False)      # duplicate=False 即真正入队
+    assert accepted == 1, f"同一信封必须恰好入队一次，实际 {accepted}"
+    assert logic.inbox_count(bob_fp) == 1
+    print("✓ R-12：并发 replay check+remember 原子（exactly-once 入队）")
+
+
+def test_budget_rejection_does_not_poison_replay_cache(tmp_path):
+    """R-11 回归: 投递被预算拒绝后, 额度恢复时同一信封可再次投递。"""
+    logic = RelayLogic(MemoryStore(max_total_bytes=300))
+    sender = Identity.generate()
+    logic.register_pubkey(_raw_pub(sender))
+    bob_fp = _fp_of(Identity.generate())
+    env = _pack(msg.PT_TEXT, _fp_of(sender), bob_fp, b"x" * 512)
+    with_payload = env + _proof_of(sender, env)
+    with pytest.raises(ValueError):
+        logic.accept(with_payload)             # 超预算拒绝
+    # 模拟预算恢复（收件方取走存量）后重试同一信封——不得被 replay cache 挡掉
+    logic.store.max_total_bytes = 10_000_000
+    assert logic.accept(with_payload)["ok"], \
+        "被拒信封重试时不得被 replay 缓存误杀"
+    print("✓ R-11：失败路径不污染 replay 状态（消息不丢）")
 
 
 def test_fp_hijack_rejected(tmp_path):

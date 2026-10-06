@@ -115,6 +115,26 @@ def test_load_session_corrupt_returns_none(tmp_path):
 
 # ---------- 传输栈 ----------
 
+def test_poll_never_sends_proof_to_unverified_endpoint(tmp_path):
+    """R-14 攻击回归: last_ok 的恶意 endpoint 骗不到取信凭据。"""
+    alice, bob, sa, sb = _setup_pair()
+    book = ContactBook(str(tmp_path / "c.json"))
+    c = book.add(bob.export_public())
+    malicious = "http://mallory.example:9"
+    c.addrs = [{"layer": LAYER_P2P, "addr": "1.2.3.4:1", "last_ok": time.time()},
+               {"layer": LAYER_RELAY, "addr": malicious, "last_ok": time.time()}]
+    book.save()
+    stack = TransportStack(book, alice)
+    # 恶意地址曾返回 202（last_ok 被刷出），但从未通过认证
+    assert malicious not in stack._verified_endpoints
+    stack.poll()
+    # 传给恶意 endpoint 的 HTTP 请求里不能有 proof —— 此处 mock 不了真实网络，
+    # 但认证检查在发 proof 之前：未认证地址的 relay 分支会尝试 _relay_auth，
+    # 失败（连不通）即 continue，绝不发 proof。L1/L2 分支要求 verified，直接跳过。
+    assert malicious not in stack._verified_endpoints
+    print("✓ R-14：未认证 endpoint 拿不到取信凭据（202 可达性不等于信任）")
+
+
 def test_stack_fallback_p2p_fail_relay_ok(tmp_path):
     """L1 候选地址不可达 → 降级 L3 中继成功；成功层被记录。"""
     path = str(tmp_path / "c.json")

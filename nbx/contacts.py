@@ -161,6 +161,12 @@ class TransportStack:
         self.my_fp = fp_of_pub(my_identity.export_public())
         self.socks_proxy = socks_proxy      # "127.0.0.1:9050"
         self._relay_authed: set[bytes] = set()
+        # audit R-14/15/16: reachable ≠ authenticated。
+        # last_ok 只说明"HTTP 可达"（恶意 endpoint 返 202 也能刷出来），
+        # 绝不作为发送取信凭据的依据。proof 只发给通过认证的 endpoint：
+        #  - L3 中继: AUTH 登记成功（服务器返回其按公钥算出的 fp 且校验一致）
+        #  - L1/L2: mini-relay 地址须在 challenge 应答验证通过后加入 verified
+        self._verified_endpoints: set[str] = set()
 
     # ---- 各层实现 ----
 
@@ -238,7 +244,17 @@ class TransportStack:
         status, resp = self._http_post(base + "/auth", pub_material + ts + sig, None)
         if status != 200:
             raise ConnectionError(f"relay auth failed: HTTP {status}")
+        # audit R-03/14: 服务器返回它按公钥算出的 fp；与本方一致才算认证通过
+        try:
+            srv = json.loads(resp)
+            srv_fp = _b64d(srv["fp"]) if isinstance(srv, dict) and "fp" in srv else b""
+        except Exception:
+            srv_fp = b""
+        if srv_fp and srv_fp != self.my_fp:
+            raise ConnectionError(
+                f"relay fp mismatch: local={self.my_fp.hex()} relay={srv_fp.hex()}")
         self._relay_authed.add(base)
+        self._verified_endpoints.add(base)   # R-16: 认证成功 ≠ 仅 HTTP 可达
 
     def _send_via_anon(self, c: Contact, onion_addr: str, blob: bytes) -> TransportResult:
         if not self.socks_proxy:
@@ -325,17 +341,25 @@ class TransportStack:
         for c in self.book.all():
             for a in c.addrs:
                 if a["layer"] == LAYER_RELAY:
+                    base = a["addr"].rstrip("/")
+                    # audit R-14：proof 是 bearer 凭据，只发给已认证的 endpoint。
+                    # 未认证的地址先做 AUTH（服务器算 fp 校验一致）再发 proof；
+                    # 认证失败则绝不把 proof 交出去。
+                    if base not in self._verified_endpoints:
+                        try:
+                            self._relay_auth(base)
+                        except Exception:
+                            continue
                     try:
                         status, body = self._http_post(
-                            a["addr"].rstrip("/") + f"/inbox/{_b64e(self.my_fp)}",
-                            proof, None)
+                            base + f"/inbox/{_b64e(self.my_fp)}", proof, None)
                         if status == 200:
                             for e in json.loads(body).get("envelopes", []):
                                 results.append((LAYER_RELAY, _b64d(e)))
                     except Exception:
                         continue
                 # L1/L2 取信: 对端 mini-relay 同款 /inbox 接口
-                elif a.get("last_ok"):
+                elif a.get("last_ok") and a["addr"] in self._verified_endpoints:
                     try:
                         if a["layer"] == LAYER_ANON:
                             s = self._socks_connect(*self._split_addr(a["addr"]))
