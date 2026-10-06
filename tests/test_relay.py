@@ -29,9 +29,17 @@ def _ed_pub(i: Identity) -> bytes:
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
 
+def _raw_pub(i: Identity) -> bytes:
+    """64B 公钥材料 x||ed（audit R-03：/auth 携带它，服务器算 fp）。"""
+    x = i.x_priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return x + _ed_pub(i)
+
+
 def _fp_of(i: Identity) -> bytes:
+    """路由指纹 = SHA-256(原始公钥材料 x||ed)[:8]（与 chat.fingerprint8 一致）。"""
     import hashlib
-    return hashlib.sha256(i.export_public().encode()).digest()[:8]
+    return hashlib.sha256(_raw_pub(i)).digest()[:8]
 
 
 def _auth_proof(i: Identity, fp: bytes) -> bytes:
@@ -114,7 +122,7 @@ def test_queue_cap_drops_oldest(tmp_path):
 def _setup_auth(logic):
     alice = Identity.generate()
     fp = _fp_of(alice)
-    logic.register_pubkey(fp, _ed_pub(alice))
+    logic.register_pubkey(_raw_pub(alice))
     return alice, fp
 
 
@@ -152,16 +160,19 @@ def test_fetch_requires_auth_and_clears(tmp_path):
 
 
 def test_tofu_key_binding(tmp_path):
+    """TOFU: fp 由钥匙决定且绑定后不可变 (R-03 后 fp 无法与钥匙解耦)。"""
     logic = RelayLogic(MemoryStore())
-    a1, a2 = Identity.generate(), Identity.generate()
-    fp = _fp_of(a1)
-    logic.register_pubkey(fp, _ed_pub(a1))
-    try:
-        logic.register_pubkey(fp, _ed_pub(a2))
-        raise AssertionError("rebind accepted")
-    except ValueError:
-        pass
-    print("✓ TOFU：指纹一旦绑定公钥，不允许换绑")
+    a1 = Identity.generate()
+    fp1 = logic.register_pubkey(_raw_pub(a1))
+    assert fp1 == _fp_of(a1)
+    # 同一钥匙重复登记（重连场景）必须幂等成功
+    fp1b = logic.register_pubkey(_raw_pub(a1))
+    assert fp1b == fp1
+    # 不同钥匙 → 不同 fp，各自独立桶（抢注不成立，见 test_fp_hijack_rejected）
+    a2 = Identity.generate()
+    fp2 = logic.register_pubkey(_raw_pub(a2))
+    assert fp2 != fp1
+    print("✓ TOFU：fp=Hash(钥匙) 且绑定幂等，钥匙决定身份")
 
 
 # ---------- HTTP 集成 ----------
@@ -170,7 +181,7 @@ def test_http_endpoints(tmp_path):
     logic = RelayLogic(MemoryStore())
     alice = Identity.generate()
     fp = _fp_of(alice)
-    logic.register_pubkey(fp, _ed_pub(alice))
+    logic.register_pubkey(_raw_pub(alice))
     handler = make_handler(logic)
 
     # health
@@ -183,12 +194,13 @@ def test_http_endpoints(tmp_path):
     # 坏信封 → 400
     status, obj = handler("POST", "/envelope", b"garbage")
     assert status == 400
-    # 未授权取信 → 403
-    status, obj = handler("GET", f"/inbox/{base64.urlsafe_b64encode(fp).decode()}", b"")
+    # 错误 proof（未授权）→ 403
+    status, obj = handler("POST", f"/inbox/{base64.urlsafe_b64encode(fp).decode()}",
+                          b"\x00" * 72)
     assert status == 403
-    # 授权取信 → 200 + 信封
-    proof = base64.urlsafe_b64encode(_auth_proof(alice, fp)).decode()
-    status, obj = handler("GET", f"/inbox/{base64.urlsafe_b64encode(fp).decode()}?proof={proof}", b"")
+    # 授权取信 → 200 + 信封（R-04: proof 在 POST body）
+    status, obj = handler("POST", f"/inbox/{base64.urlsafe_b64encode(fp).decode()}",
+                          _auth_proof(alice, fp))
     assert status == 200 and len(obj["envelopes"]) == 1
     got = base64.urlsafe_b64decode(obj["envelopes"][0] + "=" * (-len(obj["envelopes"][0]) % 4))
     assert got == env
@@ -228,8 +240,8 @@ def test_e2e_via_relay(tmp_path):
     logic = RelayLogic(MemoryStore())
     alice_id, bob_id = Identity.generate(), Identity.generate()
     a_fp, b_fp = _fp_of(alice_id), _fp_of(bob_id)
-    logic.register_pubkey(a_fp, _ed_pub(alice_id))
-    logic.register_pubkey(b_fp, _ed_pub(bob_id))
+    logic.register_pubkey(_raw_pub(alice_id))
+    logic.register_pubkey(_raw_pub(bob_id))
 
     # 会话建立（握手经 FS 信封，这里直接本地传递模拟认证信道）
     a, b = RatchetSession(), RatchetSession()
@@ -269,24 +281,48 @@ def test_http_auth_endpoint(tmp_path):
     handler = make_handler(logic)
     alice = Identity.generate()
     fp = _fp_of(alice)
-    ed_pub = _ed_pub(alice)
+    pub_material = _raw_pub(alice)
     ts = struct.pack("<Q", int(time.time()))
-    body = fp + ts + ed_pub + alice.ed_priv.sign(b"nbx-relay-auth-v1" + fp + ts)
+    # R-03: body = pub_material(64) || ts || sig，fp 由服务器计算
+    body = pub_material + ts + alice.ed_priv.sign(b"nbx-relay-auth-v1" + pub_material + ts)
     status, obj = handler("POST", "/auth", body)
     assert status == 200 and obj["ok"]
+    assert base64.urlsafe_b64decode(obj["fp"] + "=" * (-len(obj["fp"]) % 4)) == fp, \
+        "服务器算出的 fp 必须与本地 raw-byte 指纹一致"
     # 登记后可授权取信
     assert logic.authorize(fp, _auth_proof(alice, fp)) is True
     # 坏签名 → 403
-    bad = fp + ts + ed_pub + b"\x00" * 64
+    bad = pub_material + ts + b"\x00" * 64
     assert handler("POST", "/auth", bad)[0] == 403
     # 错长度 → 400
     assert handler("POST", "/auth", b"short")[0] == 400
-    # 换绑 → 409
+    # R-03 后"换绑"攻击不复存在：fp 由服务器从钥匙算出，Mallory 的钥匙
+    # 必然得到不同的 fp（见 test_fp_hijack_rejected），无法顶替 Alice 的登记
     other = Identity.generate()
     ts2 = struct.pack("<Q", int(time.time()))
-    body2 = fp + ts2 + _ed_pub(other) + other.ed_priv.sign(b"nbx-relay-auth-v1" + fp + ts2)
-    assert handler("POST", "/auth", body2)[0] == 409
-    print("✓ /auth 端点：登记/坏签名/错长度/换绑拒绝")
+    pm2 = _raw_pub(other)
+    body2 = pm2 + ts2 + other.ed_priv.sign(b"nbx-relay-auth-v1" + pm2 + ts2)
+    status2, obj2 = handler("POST", "/auth", body2)
+    assert status2 == 200
+    fp_other = base64.urlsafe_b64decode(obj2["fp"] + "=" * (-len(obj2["fp"]) % 4))
+    assert fp_other != fp, "不同钥匙必须得到不同 fp"
+    print("✓ /auth 端点：登记/服务器算 fp/坏签名/错长度/抢注不成立")
+
+
+def test_fp_hijack_rejected(tmp_path):
+    """R-03 回归：Mallory 不能用 Alice 的 fp 配自己的钥匙抢注。"""
+    logic = RelayLogic(MemoryStore())
+    handler = make_handler(logic)
+    alice, mallory = Identity.generate(), Identity.generate()
+    ts = struct.pack("<Q", int(time.time()))
+    pm_m = _raw_pub(mallory)
+    body = pm_m + ts + mallory.ed_priv.sign(b"nbx-relay-auth-v1" + pm_m + ts)
+    status, obj = handler("POST", "/auth", body)
+    assert status == 200
+    mallory_fp = base64.urlsafe_b64decode(obj["fp"] + "=" * (-len(obj["fp"]) % 4))
+    assert mallory_fp != _fp_of(alice), \
+        "Mallory 的 fp 由其自身钥匙决定，不可能等于 Alice 的 fp"
+    print("✓ R-03：指纹由服务器从公钥材料计算，抢注不成立")
 
 
 if __name__ == "__main__":

@@ -12,10 +12,11 @@
 队列上限：每个指纹最多 MAX_PER_FP 条，满了丢最旧的（防滥用）。
 
 取信授权（简化版挑战-应答，v0）：
-  客户端 GET /inbox/<fp>?proof=<b64(Ed25519_sign("nbx-relay-auth-v1" + fp + ts))>
-  服务器用该指纹登记的公钥验证（首次 AUTH 时登记）。
-  v0 简化：公钥随首封信的 AUTH 消息登记，服务器不验证身份归属——
-  指纹即地址，TOFU 模型。完整挑战-应答在 M3 收紧。
+  客户端 POST /inbox/<fp>，body = fp(8) || ts(8) || sig(64)，
+  sig = Ed25519_sign("nbx-relay-auth-v1" + fp + ts)（audit R-04：
+  proof 不走 URL query，避免进入反代/边缘访问日志可被重放）。
+  服务器用 AUTH 登记的公钥验证。AUTH 登记 pub_material(64)，
+  指纹由服务器计算（audit R-03：客户端不得自报地址）。
 
 HTTP API（任意 ASGI/WSGI 可包，核心逻辑在 RelayStore + RelayLogic）：
   POST /envelope            body = 消息信封（明文头+加密体）→ 202 或 4xx
@@ -132,13 +133,22 @@ class RelayLogic:
 
     # ---------- 取信 ----------
 
-    def register_pubkey(self, fp: bytes, ed_pub: bytes) -> None:
-        """AUTH 消息登记公钥（TOFU：首见为准）。"""
-        if len(ed_pub) != 32:
-            raise ValueError("bad pubkey length")
+    def register_pubkey(self, pub_material: bytes) -> bytes:
+        """AUTH 登记（TOFU：首见为准）。
+
+        安全（audit R-03）：中继从完整公钥材料 x||ed 自行计算指纹，
+        客户端无权自报地址——否则攻击者可用"任意 fp + 自己的钥匙"
+        抢注受害者桶（身份冒用/消息截获窗口）。
+        返回中继认定的 fp。
+        """
+        if len(pub_material) != 64:
+            raise ValueError("pub material must be 64 bytes (x||ed)")
+        fp = hashlib.sha256(pub_material).digest()[:8]
+        ed_pub = pub_material[32:]
         if fp in self._pubkeys and self._pubkeys[fp] != ed_pub:
             raise ValueError("fingerprint already bound to another key")
         self._pubkeys[fp] = ed_pub
+        return fp
 
     def authorize(self, fp: bytes, proof: bytes, now_skew: int = 300) -> bool:
         """取信授权：Ed25519_sign(AUTH_INFO || fp || ts(8))，ts 在窗口内。"""
@@ -182,32 +192,44 @@ def make_handler(logic: RelayLogic):
             except ValueError as e:
                 return 400, {"ok": False, "error": str(e)}
         if method == "POST" and path == "/auth":
-            # body = fp(8) || ts(8) || ed_pub(32) || sig(64)
-            # sig = Ed25519_sign(ed_pub 私钥, AUTH_INFO || fp || ts)
-            if len(body) != 8 + 8 + 32 + 64:
+            # body = pub_material(64) || ts(8) || sig(64)
+            # sig = Ed25519_sign(ed_priv, AUTH_INFO || pub_material || ts)
+            # 安全（R-03）：fp 由中继从 pub_material 计算，客户端不自报地址
+            if len(body) != 64 + 8 + 64:
                 return 400, {"ok": False, "error": "bad auth payload"}
-            fp, ts, ed_pub, sig = body[:8], body[8:16], body[16:48], body[48:112]
+            pub_material, ts, sig = body[:64], body[64:72], body[72:136]
             if abs(time.time() - struct.unpack("<Q", ts)[0]) > 300:
                 return 400, {"ok": False, "error": "timestamp out of window"}
             from cryptography.hazmat.primitives.asymmetric import ed25519
+            ed_pub = pub_material[32:]
             try:
                 ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(
-                    sig, AUTH_INFO + fp + ts)
+                    sig, AUTH_INFO + pub_material + ts)
             except Exception:
                 return 403, {"ok": False, "error": "bad signature"}
             try:
-                logic.register_pubkey(fp, ed_pub)
+                fp = logic.register_pubkey(pub_material)
             except ValueError as e:
                 return 409, {"ok": False, "error": str(e)}
-            return 200, {"ok": True}
-        if method == "GET" and path.startswith("/inbox/"):
-            from urllib.parse import parse_qs, urlparse
-            u = urlparse(path)
-            fp = _b64d(u.path.split("/inbox/")[1])
-            qs = parse_qs(u.query)
-            proof = _b64d(qs["proof"][0]) if "proof" in qs else b""
+            return 200, {"ok": True, "fp": _b64e(fp)}
+        if method == "POST" and path.startswith("/inbox/"):
+            # 安全（audit R-04）：proof 不走 URL query——查询串会进
+            # 反代/边缘（Cloudflare）访问日志，5 分钟窗口内可重放。
+            # 改 POST body = ts(8) || sig(64)，与 /auth 同构；fp 取自 URL path。
+            if len(body) != 8 + 64:
+                return 400, {"ok": False, "error": "bad proof payload"}
+            fp_b64 = path.split("/inbox/", 1)[1]
             try:
-                envs = logic.fetch(fp, proof)
+                fp = _b64d(fp_b64)
+            except Exception:
+                return 400, {"ok": False, "error": "bad fingerprint"}
+            if len(fp) != 8:
+                return 400, {"ok": False, "error": "bad fingerprint"}
+            ts, sig = body[:8], body[8:72]
+            if abs(time.time() - struct.unpack("<Q", ts)[0]) > 300:
+                return 403, {"ok": False, "error": "timestamp out of window"}
+            try:
+                envs = logic.fetch(fp, ts + sig)
                 return 200, {"ok": True,
                              "envelopes": [_b64e(e) for e in envs]}
             except PermissionError:

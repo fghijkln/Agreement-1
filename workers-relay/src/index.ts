@@ -3,8 +3,8 @@
  *
  * 与 Python 版（nbx/relay.py）协议一致：
  *   POST /envelope      投递信封（明文头 + 加密体，服务器不解密）
- *   POST /auth          TOFU 公钥登记（fp + ts + ed_pub + sig）
- *   GET  /inbox/<fp>    取信（?proof= ts+sig，取走即清）
+ *   POST /auth          TOFU 公钥登记（pub_material(64) + ts + sig，fp 服务器计算）
+ *   POST /inbox/<fp>    取信（body = ts + sig，取走即清；audit R-04 不走 URL）
  *   GET  /health        存活探测
  *
  * 存储：每页一个 Durable Object（强一致 + alarms 做 TTL 清理）。
@@ -108,27 +108,32 @@ export default {
     if (url.pathname === "/health") return json(200, { ok: true });
 
     if (req.method === "POST" && url.pathname === "/auth") {
+      // body = pub_material(64) || ts(8) || sig(64)
+      // sig = Ed25519_sign(AUTH_INFO || pub_material || ts)
+      // 安全（audit R-03）：fp 由服务器从 pub_material 计算，客户端不自报地址
       const body = new Uint8Array(await req.arrayBuffer());
-      if (body.length !== 8 + 8 + 32 + 64) return json(400, { ok: false, error: "bad auth payload" });
-      const fp = body.slice(0, 8);
-      const tsBytes = body.slice(8, 16);
-      const pubRaw = body.slice(16, 48);
-      const sig = body.slice(48, 112);
-      const ts = new DataView(tsBytes.buffer, 0, 8).getBigUint64(0, true);
+      if (body.length !== 64 + 8 + 64) return json(400, { ok: false, error: "bad auth payload" });
+      const pubMaterial = body.slice(0, 64);
+      const tsBytes = body.slice(64, 72);
+      const sig = body.slice(72, 136);
+      const ts = new DataView(tsBytes.buffer, tsBytes.byteOffset, 8).getBigUint64(0, true);
       const nowS = BigInt(Math.floor(Date.now() / 1000));
       if (ts > nowS + BigInt(AUTH_SKEW_S) || ts < nowS - BigInt(AUTH_SKEW_S))
         return json(400, { ok: false, error: "timestamp out of window" });
+      const edPub = pubMaterial.slice(32, 64);
       const ok = await ed25519Verify(
-        pubRaw, sig,
-        concat(new TextEncoder().encode(AUTH_INFO), fp, tsBytes));
+        edPub, sig,
+        concat(new TextEncoder().encode(AUTH_INFO), pubMaterial, tsBytes));
       if (!ok) return json(403, { ok: false, error: "bad signature" });
+      const fp = new Uint8Array(
+        await crypto.subtle.digest("SHA-256", pubMaterial as BufferSource)).slice(0, 8);
       const id = env.NBX_FP.idFromName(b64urlEncode(fp));
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pubkey", {
-        method: "PUT", body: pubRaw as BodyInit,
+        method: "PUT", body: edPub as BodyInit,
       });
       if (resp.status === 409) return json(409, { ok: false, error: "fingerprint already bound to another key" });
-      return json(200, { ok: true });
+      return json(200, { ok: true, fp: b64urlEncode(fp) });
     }
 
     if (req.method === "POST" && url.pathname === "/envelope") {
@@ -147,18 +152,24 @@ export default {
       return json(resp.status === 202 ? 202 : 400, await resp.json());
     }
 
-    if (req.method === "GET" && url.pathname.startsWith("/inbox/")) {
+    if (req.method === "POST" && url.pathname.startsWith("/inbox/")) {
+      // 安全（audit R-04）：proof 走 POST body，不进 URL/访问日志。
+      // body = ts(8 LE) || sig(64)，sig = Ed25519_sign(AUTH_INFO || fp || ts)
       const fpB64 = url.pathname.slice("/inbox/".length);
-      const proofB64 = url.searchParams.get("proof") ?? "";
-      let fp: Uint8Array, proof: Uint8Array;
+      const body = new Uint8Array(await req.arrayBuffer());
+      if (body.length !== 72) return json(400, { ok: false, error: "bad proof payload" });
+      const ts = new DataView(body.buffer, body.byteOffset, 8).getBigUint64(0, true);
+      const nowS = BigInt(Math.floor(Date.now() / 1000));
+      if (ts > nowS + BigInt(AUTH_SKEW_S) || ts < nowS - BigInt(AUTH_SKEW_S))
+        return json(403, { ok: false, error: "timestamp out of window" });
+      let fp: Uint8Array;
       try {
         fp = b64urlDecode(fpB64);
-        proof = proofB64 ? b64urlDecode(proofB64) : new Uint8Array(0);
       } catch {
         return json(400, { ok: false, error: "bad request" });
       }
       if (fp.length !== 8) return json(400, { ok: false, error: "bad request" });
-      if (!await authorize(env, fp, proof)) return json(403, { ok: false, error: "unauthorized" });
+      if (!await authorize(env, fp, body)) return json(403, { ok: false, error: "unauthorized" });
       const id = env.NBX_FP.idFromName(fpB64);
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pop");

@@ -88,7 +88,7 @@ def test_outbox_flush_order(tmp_path):
     rs.finish(a.identity, peer_ed, None, speaks_first=True) if False else None
     # 直接构造最小 session 桩
     class StubSession:
-        def encrypt(self, data):
+        def encrypt(self, data, outer_aad=b""):
             return b"x" * 40
 
         def export_state(self):

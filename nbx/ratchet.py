@@ -45,7 +45,7 @@ MAGIC_STATE = b"NBXRATCHST1"
 HEADER_SIZE = 40
 NONCE_SIZE = 12
 MAX_SKIP = 256
-HANDSHAKE_SIZE = 9 + 32 + 8 + 64   # magic + eph_pub + ts + sig
+HANDSHAKE_SIZE = 9 + 8 + 8 + 32 + 8 + 64   # magic + sender_fp + recv_fp + eph_pub + ts + sig
 HANDSHAKE_MAX_AGE = 120.0          # 握手时效（秒）：超龄=上一代会话残留，拒绝
 
 
@@ -57,7 +57,7 @@ def handshake_age(hs: bytes) -> float:
     """握手载荷的时间戳距今秒数（负数=来自未来，允许时钟小偏差）。"""
     if len(hs) != HANDSHAKE_SIZE or hs[:9] != MAGIC_RATCHET:
         raise ValueError("bad handshake payload")
-    return time.time() - struct.unpack("<Q", hs[41:49])[0]
+    return time.time() - struct.unpack("<Q", hs[57:65])[0]
 
 INFO_ROOT = b"nbx-ratchet-root-v1"
 INFO_CHAIN = b"nbx-ratchet-chain-v1"
@@ -97,32 +97,59 @@ def unpack_header(hdr: bytes) -> tuple[bytes, int, int]:
     return hdr[:32], struct.unpack("<I", hdr[32:36])[0], struct.unpack("<I", hdr[36:40])[0]
 
 
-def make_handshake(identity: Identity, eph_pub: bytes) -> bytes:
-    """MAGIC || eph_pub || ts(8) || Ed25519_sign(MAGIC||eph_pub||ts)。"""
+def make_handshake(identity: Identity, eph_pub: bytes,
+                   sender_fp: bytes = b"\x00" * 8,
+                   recv_fp: bytes = b"\x00" * 8) -> bytes:
+    """握手 v2（audit R-05）：签名绑定路由头。
+
+    MAGIC || sender_fp(8) || recv_fp(8) || eph_pub || ts(8) || sig，
+    sig = Ed25519_sign(MAGIC || sender_fp || recv_fp || eph_pub || ts)。
+    绑定收发双方指纹后，"Bob→Carol 的合法握手被投给 Alice"的反射
+    攻击不再成立：Alice 校验 recv_fp==自己 即拒收。
+    """
     ts = struct.pack("<Q", int(time.time()))
-    sig = identity.ed_priv.sign(MAGIC_RATCHET + eph_pub + ts)
-    return MAGIC_RATCHET + eph_pub + ts + sig
+    sig = identity.ed_priv.sign(
+        MAGIC_RATCHET + sender_fp + recv_fp + eph_pub + ts)
+    return MAGIC_RATCHET + sender_fp + recv_fp + eph_pub + ts + sig
 
 
 def verify_handshake(peer_ed_pub: bytes, hs: bytes,
-                     max_age: float = HANDSHAKE_MAX_AGE) -> bytes:
-    """验签并返回对端临时公钥；签名绑定 eph_pub + 时间戳。
+                     max_age: float = HANDSHAKE_MAX_AGE,
+                     expect_sender_fp: bytes | None = None,
+                     expect_recv_fp: bytes | None = None) -> bytes:
+    """验签并返回对端临时公钥；签名绑定路由指纹 + eph_pub + 时间戳。
 
-    max_age：握手时间戳的最大有效期（秒）。桶里的握手信封 TTL 是 7 天，
-    而一次握手的临时密钥只该存活几秒到几分钟——超龄握手意味着"上一代
-    会话的残留信封"（中继重启/重装/多轮重试堆积），用它建会话会与对端
-    当前会话错位，表现为解密 InvalidTag。0 表示不做时效检查（仅测试用）。
+    expect_sender_fp/expect_recv_fp（audit R-05）：提供时校验载荷中的
+    路由指纹——接收端必须确认"这条握手是发给我的、来自我认识的对方"，
+    否则不同会话的握手可被反射/重定向到任意桶。
+    max_age：握手时间戳的最大有效期（秒）。0 表示不做时效检查（仅测试）。
     """
     if len(hs) != HANDSHAKE_SIZE or hs[:9] != MAGIC_RATCHET:
         raise ValueError("bad handshake payload")
-    eph_pub, ts, sig = hs[9:41], hs[41:49], hs[49:113]
+    sender_fp, recv_fp = hs[9:17], hs[17:25]
+    eph_pub, ts, sig = hs[25:57], hs[57:65], hs[65:129]
+    if expect_sender_fp is not None and sender_fp != expect_sender_fp:
+        raise ValueError("handshake sender_fp mismatch")
+    if expect_recv_fp is not None and recv_fp != expect_recv_fp:
+        raise ValueError("handshake recv_fp mismatch (not addressed to us)")
     ed25519.Ed25519PublicKey.from_public_bytes(peer_ed_pub).verify(
-        sig, MAGIC_RATCHET + eph_pub + ts)
+        sig, MAGIC_RATCHET + sender_fp + recv_fp + eph_pub + ts)
     if max_age > 0:
         age = time.time() - struct.unpack("<Q", ts)[0]
         if age > max_age or age < -max_age:      # 过龄或来自过远的未来都拒
             raise HandshakeStale(f"handshake age {age:.0f}s outside ±{max_age:.0f}s")
     return eph_pub
+
+
+def _state_integrity_tag(root_key: bytes, blob: bytes) -> bytes:
+    """状态序列化的完整性标签（非机密性）。
+
+    HKDF(ikm=root_key, info=MAGIC_STATE) 派生 16B tag 绑定整个 TLV
+    序列：检测落盘损坏、截断与"拿错会话状态文件"。root_key 本身是
+    秘密，tag 不新增攻击面。防恶意回滚需外部单调 epoch 存储（daemon 层）。
+    """
+    return HKDF(algorithm=hashes.SHA256(), length=16, salt=None,
+                info=MAGIC_STATE + b"state-integrity").derive(root_key)
 
 
 class RatchetSession:
@@ -142,21 +169,38 @@ class RatchetSession:
 
     # ---------- 建立（两阶段，双方交换临时密钥） ----------
 
-    def begin(self, my_id: Identity) -> bytes:
-        """阶段一：生成本方临时密钥并返回握手载荷。双方都调用。"""
+    def begin(self, my_id: Identity, sender_fp: bytes | None = None,
+              recv_fp: bytes | None = None) -> bytes:
+        """阶段一：生成本方临时密钥并返回握手载荷。双方都调用。
+
+        sender_fp/recv_fp（audit R-05）：路由指纹绑进签名。缺省为
+        8 字节零值（格式固定 129B，兼容无指纹上下文的裸 ratchet 测试）；
+        正式通道必须显式传入真实指纹。
+        """
+        if sender_fp is None:
+            sender_fp = b"\x00" * 8
+        if recv_fp is None:
+            recv_fp = b"\x00" * 8
         self._eph = x25519.X25519PrivateKey.generate()
         self._eph_pub = _raw_pub(self._eph)
-        return make_handshake(my_id, self._eph_pub)
+        self._hs_sender_fp = sender_fp
+        self._hs_recv_fp = recv_fp
+        return make_handshake(my_id, self._eph_pub, sender_fp, recv_fp)
 
     def finish(self, my_id: Identity, peer_ed_pub: bytes, peer_hs: bytes,
-               speaks_first: bool):
+               speaks_first: bool, expect_sender_fp: bytes | None = None,
+               expect_recv_fp: bytes | None = None):
         """阶段二：验对方载荷 → 派生 SK → 初始化链。
 
         speaks_first：本方是否先发消息。两方必须恰好一方为 True——
         初始链 CK0 只能单向使用（避免同一链密钥双向密钥重用），
         先发方持发送链，后发方持接收链；后发方首次发送时 DH ratchet 换新链。
+        expect_sender_fp/expect_recv_fp（audit R-05）：校验握手路由头，
+        确认握手来自预期对端且是发给本方的。
         """
-        peer_eph_pub = verify_handshake(peer_ed_pub, peer_hs)
+        peer_eph_pub = verify_handshake(peer_ed_pub, peer_hs,
+                                        expect_sender_fp=expect_sender_fp,
+                                        expect_recv_fp=expect_recv_fp)
         dh_shared = _dh(self._eph, peer_eph_pub)
         # salt 按字典序拼接，保证双方派生出同一 SK
         lo, hi = sorted((self._eph_pub, peer_eph_pub))
@@ -205,6 +249,12 @@ class RatchetSession:
         out += f(6, sk_blob)
         counters = struct.pack("<III", self._prev_send_len, self._send_n, self._recv_n)
         out += f(7, counters)
+        # 完整性校验（audit ⑤ 防篡改/损坏）：HKDF 以 root_key 为输入信息
+        # 派生 tag——不是 MAC 密钥，不增加安全性，但能检测落盘损坏/
+        # 意外混入的其他会话状态。真正的防回滚需要持久化 epoch 序号
+        # + 单调存储（M3 daemon 层处理）。
+        tag = _state_integrity_tag(self._root_key, out)
+        out += f(8, tag)
         return _b64.b64encode(out)
 
     @classmethod
@@ -236,6 +286,13 @@ class RatchetSession:
             s._skipped[(pub, no)] = sk_blob[po + 36:po + 68]
             po += 68
         s._prev_send_len, s._send_n, s._recv_n = struct.unpack("<III", fields[7])
+        # 完整性校验（audit ⑤）：tag 必须与 root_key 绑定的 TLV 序列一致
+        if 8 not in fields or len(fields[8]) != 16:
+            raise ValueError("ratchet state missing integrity tag")
+        body = raw[:raw.rfind(bytes([8]) + struct.pack("<I", 16))]
+        if _state_integrity_tag(s._root_key, body) != fields[8]:
+            raise ValueError("ratchet state integrity check failed "
+                             "(corrupted or foreign state file)")
         s._established = True
         return s
 
@@ -296,8 +353,13 @@ class RatchetSession:
             self._skipped[(ratchet_pub, self._recv_n)] = mk
             self._recv_n += 1
 
-    def encrypt(self, plaintext: bytes) -> bytes:
-        """加密一条消息 → header(40) || nonce(12) || ct。"""
+    def encrypt(self, plaintext: bytes, outer_aad: bytes = b"") -> bytes:
+        """加密一条消息 → header(40) || nonce(12) || ct。
+
+        outer_aad（audit 补充项）：外层消息信封的路由头，与本层
+        ratchet 头一起纳入 AEAD 认证——防止密文被搬到不同路由头的
+        信封里重放（头本身明文，不认证则可被中继/攻击者重写）。
+        """
         if not self._established:
             raise RuntimeError("session not established")
         if self._send_ck is None:
@@ -307,13 +369,15 @@ class RatchetSession:
         self._send_ck, mk = _kdf_ck(self._send_ck)
         nonce = secrets.token_bytes(NONCE_SIZE)
         hdr = pack_header(self._dh_self_pub, self._prev_send_len, self._send_n)
-        ct = ChaCha20Poly1305(mk).encrypt(nonce, plaintext, MAGIC_RATCHET + hdr)
+        ct = ChaCha20Poly1305(mk).encrypt(
+            nonce, plaintext, MAGIC_RATCHET + hdr + outer_aad)
         self._send_n += 1
         return hdr + nonce + ct
 
-    def decrypt(self, blob: bytes) -> bytes:
+    def decrypt(self, blob: bytes, outer_aad: bytes = b"") -> bytes:
         """解密一条消息（容忍乱序，skipped 键上限 MAX_SKIP）。
 
+        outer_aad：外层信封路由头，须与加密时一致（audit 补充项）。
         事务式状态更新（Signal spec："如果消息认证失败，对 state 的
         修改必须被丢弃"）：ratchet 推进全部发生在快照上，AEAD 认证
         成功才提交；失败则回滚——攻击者伪造/篡改的报文无法污染会话
@@ -327,7 +391,7 @@ class RatchetSession:
         nonce = blob[HEADER_SIZE:HEADER_SIZE + NONCE_SIZE]
         ct = blob[HEADER_SIZE + NONCE_SIZE:]
         ratchet_pub, prev_len, msg_no = unpack_header(hdr)
-        aad = MAGIC_RATCHET + hdr
+        aad = MAGIC_RATCHET + hdr + outer_aad
 
         snap = self._snapshot()
         try:

@@ -48,6 +48,17 @@ def fingerprint_of(pub_material: bytes) -> bytes:
     return hashlib.sha256(pub_material).digest()[:8]
 
 
+def routing_aad(ptype: int, sender_fp: bytes, recv_fp: bytes) -> bytes:
+    """外层路由头的 AAD 形式（audit 补充项）。
+
+    AAD = HEADER 前 28 字节（magic+ver+ptype+flags+reserved+sender_fp+
+    recv_fp）——msg_id 随机生成、body_len 依赖密文长度，加密时未知；
+    绑定 ptype + 收发指纹已足以阻止"密文搬进别的信封/别的类型重放"。
+    """
+    return HEADER.pack(MAGIC_MSG, VERSION, ptype, 0, 0,
+                       sender_fp, recv_fp, b"\x00" * 16, 0)[:28]
+
+
 def pack_message(ptype: int, sender_fp: bytes, recv_fp: bytes,
                  body: bytes, msg_id: bytes | None = None,
                  flags: int = 0) -> bytes:

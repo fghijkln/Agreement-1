@@ -66,7 +66,8 @@ class ContactSession:
             return                          # 已有在途握手，等对方 finish
         self.handshake_sent_at = now
         hs = RatchetSession()
-        payload = hs.begin(self.daemon.identity)
+        payload = hs.begin(self.daemon.identity, self.daemon.my_fp,
+                           self.peer_fp)
         self.daemon._pending_hs[self.peer_fp] = hs     # 对方握手到达时 finish
         wire = msg.pack_message(msg.PT_HANDSHAKE, self.daemon.my_fp,
                                 self.peer_fp, payload)
@@ -84,11 +85,14 @@ class ContactSession:
         if hs is None:
             # 纯被动方：新建本方会话并回发握手
             hs = RatchetSession()
-            payload = hs.begin(self.daemon.identity)
+            payload = hs.begin(self.daemon.identity, self.daemon.my_fp,
+                               self.peer_fp)
             self.daemon.client.post_envelope(msg.pack_message(
                 msg.PT_HANDSHAKE, self.daemon.my_fp, self.peer_fp, payload))
         hs.finish(self.daemon.identity, self.daemon._peer_ed_pub(self.peer_pub),
-                  peer_hs, speaks_first=self.daemon.speaks_first_for(self.peer_pub))
+                  peer_hs, speaks_first=self.daemon.speaks_first_for(self.peer_pub),
+                  expect_sender_fp=self.peer_fp,
+                  expect_recv_fp=self.daemon.my_fp)
         self.session = hs
         self.daemon.save_session(self)
         self.daemon.log_event(f"会话建立 ✓ {self.peer_fp.hex()}")
@@ -107,16 +111,24 @@ class ContactSession:
             return {"queued": True,
                     "note": "无活跃会话：已发握手，消息入 outbox 待自动补发"}
         wire = msg.pack_message(msg.PT_TEXT, self.daemon.my_fp,
-                                self.peer_fp, self.session.encrypt(text.encode()))
+                                self.peer_fp,
+                                self.session.encrypt(
+                                    text.encode(),
+                                    outer_aad=msg.routing_aad(
+                                        msg.PT_TEXT, self.daemon.my_fp,
+                                        self.peer_fp)))
         self.daemon.client.post_envelope(wire)
         self.daemon.log_message("out", self.peer_fp, text)
         self.daemon.save_session(self)          # 每条消息后立即持久化（ratchet 前跳）
         return {"queued": False}
 
-    def decrypt_incoming(self, body: bytes) -> str:
+    def decrypt_incoming(self, body: bytes, sender_fp: bytes = b"",
+                         recv_fp: bytes = b"") -> str:
         if self.session is None:
             raise RuntimeError("no active session")
-        text = self.session.decrypt(body).decode("utf-8")
+        aad = (msg.routing_aad(msg.PT_TEXT, sender_fp, recv_fp)
+               if sender_fp and recv_fp else b"")
+        text = self.session.decrypt(body, outer_aad=aad).decode("utf-8")
         self.daemon.save_session(self)
         return text
 
@@ -307,7 +319,8 @@ class Daemon:
                 self.log_event(f"TEXT 先于握手，暂缓 {peer_fp.hex()}")
                 return
             try:
-                text = cs.decrypt_incoming(m["body"])
+                text = cs.decrypt_incoming(m["body"], m["sender_fp"],
+                                           m["recv_fp"])
             except Exception:
                 # 可能是旧会话残留——握手代际防护之下应已罕见
                 self.log_event(f"TEXT 解密失败 from {peer_fp.hex()}（旧代残留?）")

@@ -66,8 +66,26 @@ def _b64d(s: str) -> bytes:
 
 
 def fingerprint8(pub_b64: str) -> bytes:
-    """与中继分桶一致的 8 字节指纹（SHA-256(公钥材料) 前 8 字节）。"""
-    return hashlib.sha256(pub_b64.encode()).digest()[:8]
+    """8 字节路由指纹 = SHA-256(原始公钥材料 x||ed)[:8]。
+
+    与 fskey.Identity.fingerprint()（用户可见 base32 显示形式）同源：
+    绑定公钥字节本身而非其 base64 编码。历史版本曾哈希 b64 字符串——
+    与身份显示指纹不一致（安全审计要求统一后以原始字节为准）。
+    """
+    pub_raw = base64.b64decode(pub_b64 + "=" * (-len(pub_b64) % 4))
+    if len(pub_raw) != 64:
+        raise ValueError("public material must be 64 bytes (x||ed)")
+    return hashlib.sha256(pub_raw).digest()[:8]
+
+
+def raw_public(identity: Identity) -> bytes:
+    """64B 原始公钥材料（x||ed），AUTH 协议携带、中继据此计算 fp。"""
+    from cryptography.hazmat.primitives import serialization
+    x_pub = identity.x_priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    ed_pub = identity.ed_priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return x_pub + ed_pub
 
 
 def auth_proof(identity: Identity, fp: bytes) -> bytes:
@@ -87,26 +105,31 @@ class RelayClient:
             return json.loads(r.read())
 
     def auth(self, identity: Identity, fp: bytes) -> None:
-        """登记公钥（TOFU）：证明持有该指纹的私钥。"""
+        """登记公钥（TOFU）：证明持有该指纹的私钥。
+
+        安全（audit R-03）：发送完整公钥材料 x||ed，fp 由中继计算——
+        客户端无法用别人的 fp 配自己的钥匙抢注。
+        """
         ts = struct.pack("<Q", int(time.time()))
-        ed_pub = identity.ed_priv.public_key().public_bytes_raw() \
-            if hasattr(identity.ed_priv, "public_key_raw") else \
-            identity.ed_priv.public_key().public_bytes(
-                __import__("cryptography.hazmat.primitives.serialization",
-                           fromlist=["Encoding"]).Encoding.Raw,
-                __import__("cryptography.hazmat.primitives.serialization",
-                           fromlist=["PublicFormat"]).PublicFormat.Raw)
-        body = fp + ts + ed_pub + identity.ed_priv.sign(AUTH_INFO + fp + ts)
+        pub_material = raw_public(identity)
+        body = pub_material + ts + identity.ed_priv.sign(
+            AUTH_INFO + pub_material + ts)
         req = _http_req(self.base + "/auth", data=body, method="POST")
         with _urlopen_retry(req) as r:
             obj = json.loads(r.read())
         if not obj.get("ok"):
             raise PermissionError(f"relay auth failed: {obj}")
+        # 中继认定的 fp 必须与本地一致（钥匙对不上立即报错，而非静默错桶）
+        srv_fp = _b64d(obj.get("fp", ""))
+        if srv_fp and srv_fp != fp:
+            raise PermissionError(
+                f"relay fp mismatch: local={fp.hex()} relay={srv_fp.hex()}")
 
     def fetch(self, fp: bytes, proof: bytes) -> list[bytes]:
-        url = f"{self.base}/inbox/{_b64e(fp)}?proof={_b64e(proof)}"
+        # 安全（audit R-04）：proof 走 POST body，不进 URL/访问日志
+        url = f"{self.base}/inbox/{_b64e(fp)}"
         try:
-            with _urlopen_retry(_http_req(url)) as r:
+            with _urlopen_retry(_http_req(url, data=proof, method="POST")) as r:
                 obj = json.loads(r.read())
             return [_b64d(e) for e in obj.get("envelopes", [])]
         except urllib.error.HTTPError as e:
@@ -139,12 +162,14 @@ class ChatSession:
         """AUTH 登记 → 发握手 + 收对方握手（经中继）。"""
         self.client.auth(self.identity, self.my_fp)
         hs = RatchetSession()
-        payload = hs.begin(self.identity)
+        payload = hs.begin(self.identity, self.my_fp, self.peer_fp)
         self.client.post_envelope(msg.pack_message(
             msg.PT_HANDSHAKE, self.my_fp, self.peer_fp, payload))
         peer_hs = self._wait_handshake()
         hs.finish(self.identity, self.peer_ed_pub, peer_hs,
-                  speaks_first=self.speaks_first)
+                  speaks_first=self.speaks_first,
+                  expect_sender_fp=self.peer_fp,
+                  expect_recv_fp=self.my_fp)
         self.session = hs
 
     def _wait_handshake(self, timeout: float = 30.0) -> bytes:
@@ -155,7 +180,7 @@ class ChatSession:
         因此这里丢弃过期握手（verify_handshake 的时效检查），并在一批
         信封里选时间戳最新的握手，而不是"取到第一个就用"。
         """
-        from .ratchet import HandshakeStale, handshake_age
+        from .ratchet import HANDSHAKE_MAX_AGE, handshake_age
         deadline = time.time() + timeout
         while time.time() < deadline:
             for blob in self.client.fetch(
@@ -165,10 +190,9 @@ class ChatSession:
                     # 正文先到（与握手同批）：缓存，poll_once 时解密
                     self._pending.append(blob)
                     continue
-                try:
-                    handshake_age(m["body"])     # 先做过期筛除
-                except HandshakeStale:
-                    continue                     # 旧代残留：丢弃
+                age = handshake_age(m["body"])
+                if abs(age) > HANDSHAKE_MAX_AGE:
+                    continue                     # 旧代残留/未来时钟：丢弃
                 # 候选握手。记录最新的；旧候选已被过期筛除挡住，
                 # 同批多个新鲜握手（对端连发两轮）取 ts 较新者。
                 if (self._hs_candidate is None or
@@ -186,8 +210,10 @@ class ChatSession:
     def send_text(self, text: str) -> bytes:
         if self.session is None:
             raise RuntimeError("not connected")
-        wire = msg.pack_message(msg.PT_TEXT, self.my_fp, self.peer_fp,
-                                self.session.encrypt(text.encode("utf-8")))
+        inner = self.session.encrypt(
+            text.encode("utf-8"), outer_aad=msg.routing_aad(
+                msg.PT_TEXT, self.my_fp, self.peer_fp))
+        wire = msg.pack_message(msg.PT_TEXT, self.my_fp, self.peer_fp, inner)
         self.client.post_envelope(wire)
         return wire
 
@@ -202,7 +228,11 @@ class ChatSession:
             m = msg.parse_message(blob)
             if m["ptype"] == msg.PT_TEXT:
                 out.append((msg.PT_TEXT,
-                            self.session.decrypt(m["body"]).decode("utf-8")))
+                            self.session.decrypt(
+                                m["body"],
+                                outer_aad=msg.routing_aad(
+                                    msg.PT_TEXT, m["sender_fp"],
+                                    m["recv_fp"])).decode("utf-8")))
         return out
 
 

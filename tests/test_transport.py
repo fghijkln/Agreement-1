@@ -130,7 +130,9 @@ def test_stack_fallback_p2p_fail_relay_ok(tmp_path):
 
     # 起真中继
     logic = RelayLogic(MemoryStore())
-    logic.register_pubkey(fp_of_pub(bob.export_public()), _ed(bob))
+    import base64 as _b64
+    _pb = bob.export_public()
+    logic.register_pubkey(_b64.b64decode(_pb + "=" * (-len(_pb) % 4)))
     srv = RelayServer(logic, port=18801)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()

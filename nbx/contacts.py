@@ -40,7 +40,13 @@ LAYER_NAMES = {LAYER_P2P: "p2p", LAYER_ANON: "anon", LAYER_RELAY: "relay"}
 
 
 def fp_of_pub(pub_b64: str) -> bytes:
-    return hashlib.sha256(pub_b64.encode()).digest()[:8]
+    """路由指纹 = SHA-256(原始公钥材料 x||ed)[:8]。
+
+    audit R-03 配套统一：与 chat.fingerprint8 / fskey.fingerprint /
+    服务器端 fp 计算同源（历史版本哈希 b64 字符串，与身份显示指纹不一致）。
+    """
+    pub_raw = base64.b64decode(pub_b64 + "=" * (-len(pub_b64) % 4))
+    return hashlib.sha256(pub_raw).digest()[:8]
 
 
 def fp_b32(fp: bytes) -> str:
@@ -211,15 +217,17 @@ class TransportStack:
             return TransportResult(LAYER_RELAY, False, str(e))
 
     def _relay_auth(self, base: str):
-        """TOFU 登记本方公钥（与 nbx/chat.py RelayClient.auth 同格式）。"""
+        """TOFU 登记本方公钥（audit R-03：发送 64B 公钥材料，fp 由服务器算）。"""
         import struct as _s
         ts = _s.pack("<Q", int(time.time()))
         from cryptography.hazmat.primitives import serialization
+        x_pub = self.me.x_priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         ed_pub = self.me.ed_priv.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        sig = self.me.ed_priv.sign(b"nbx-relay-auth-v1" + self.my_fp + ts)
-        body = self.my_fp + ts + ed_pub + sig
-        status, resp = self._http_post(base + "/auth", body, None)
+        pub_material = x_pub + ed_pub
+        sig = self.me.ed_priv.sign(b"nbx-relay-auth-v1" + pub_material + ts)
+        status, resp = self._http_post(base + "/auth", pub_material + ts + sig, None)
         if status != 200:
             raise ConnectionError(f"relay auth failed: HTTP {status}")
         self._relay_authed.add(base)
@@ -299,6 +307,7 @@ class TransportStack:
     def poll(self, peer_hint: bytes | None = None) -> list[tuple[int, bytes]]:
         """从所有可达层取信（L3 中继取自己桶；L1/L2 的对端 mini-relay 同理）。
 
+        audit R-04：proof 走 POST body，不进 URL。
         返回 [(layer, envelope_bytes), ...]。
         """
         results: list[tuple[int, bytes]] = []
@@ -307,9 +316,9 @@ class TransportStack:
             for a in c.addrs:
                 if a["layer"] == LAYER_RELAY:
                     try:
-                        status, body = self._http_get(
-                            a["addr"].rstrip("/") + f"/inbox/{_b64e(self.my_fp)}?proof={_b64e(proof)}",
-                            None)
+                        status, body = self._http_post(
+                            a["addr"].rstrip("/") + f"/inbox/{_b64e(self.my_fp)}",
+                            proof, None)
                         if status == 200:
                             for e in json.loads(body).get("envelopes", []):
                                 results.append((LAYER_RELAY, _b64d(e)))
@@ -323,8 +332,9 @@ class TransportStack:
                         else:
                             host, port = self._split_addr(a["addr"])
                             s = socket.create_connection((host, port), timeout=5)
-                        http = (f"GET /inbox/{_b64e(self.my_fp)}?proof={_b64e(proof)} "
-                                f"HTTP/1.0\r\nHost: {a['addr']}\r\n\r\n").encode()
+                        body = proof
+                        http = (f"POST /inbox/{_b64e(self.my_fp)} HTTP/1.0\r\nHost: {a['addr']}\r\n"
+                                f"Content-Length: {len(body)}\r\n\r\n").encode() + body
                         s.sendall(http)
                         resp = b""
                         while True:

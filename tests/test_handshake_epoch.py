@@ -15,16 +15,18 @@ from nbx.ratchet import (RatchetSession, HandshakeStale, handshake_age,
 from nbx import message as msg
 
 
-def _mk_hs(identity, eph_pub=None, ts=None):
-    """构造握手载荷，可注入旧时间戳。"""
+def _mk_hs(identity, eph_pub=None, ts=None, sender_fp=b"\x00" * 8,
+           recv_fp=b"\x00" * 8):
+    """构造握手 v2 载荷，可注入旧时间戳。"""
     if eph_pub is None:
         eph_pub = bytes(range(32))
     if ts is None:
         ts = int(time.time())
     import struct
     ts_b = struct.pack("<Q", ts)
-    sig = identity.ed_priv.sign(b"NBXRATCH1" + eph_pub + ts_b)
-    return b"NBXRATCH1" + eph_pub + ts_b + sig
+    sig = identity.ed_priv.sign(
+        b"NBXRATCH1" + sender_fp + recv_fp + eph_pub + ts_b)
+    return b"NBXRATCH1" + sender_fp + recv_fp + eph_pub + ts_b + sig
 
 
 def test_stale_handshake_rejected(tmp_path):
