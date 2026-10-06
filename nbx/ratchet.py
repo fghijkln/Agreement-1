@@ -46,6 +46,18 @@ HEADER_SIZE = 40
 NONCE_SIZE = 12
 MAX_SKIP = 256
 HANDSHAKE_SIZE = 9 + 32 + 8 + 64   # magic + eph_pub + ts + sig
+HANDSHAKE_MAX_AGE = 120.0          # 握手时效（秒）：超龄=上一代会话残留，拒绝
+
+
+class HandshakeStale(Exception):
+    """握手信封超出时效窗口——上一代会话的残留，须丢弃并继续等待最新握手。"""
+
+
+def handshake_age(hs: bytes) -> float:
+    """握手载荷的时间戳距今秒数（负数=来自未来，允许时钟小偏差）。"""
+    if len(hs) != HANDSHAKE_SIZE or hs[:9] != MAGIC_RATCHET:
+        raise ValueError("bad handshake payload")
+    return time.time() - struct.unpack("<Q", hs[41:49])[0]
 
 INFO_ROOT = b"nbx-ratchet-root-v1"
 INFO_CHAIN = b"nbx-ratchet-chain-v1"
@@ -92,13 +104,24 @@ def make_handshake(identity: Identity, eph_pub: bytes) -> bytes:
     return MAGIC_RATCHET + eph_pub + ts + sig
 
 
-def verify_handshake(peer_ed_pub: bytes, hs: bytes) -> bytes:
-    """验签并返回对端临时公钥；签名绑定 eph_pub + 时间戳。"""
+def verify_handshake(peer_ed_pub: bytes, hs: bytes,
+                     max_age: float = HANDSHAKE_MAX_AGE) -> bytes:
+    """验签并返回对端临时公钥；签名绑定 eph_pub + 时间戳。
+
+    max_age：握手时间戳的最大有效期（秒）。桶里的握手信封 TTL 是 7 天，
+    而一次握手的临时密钥只该存活几秒到几分钟——超龄握手意味着"上一代
+    会话的残留信封"（中继重启/重装/多轮重试堆积），用它建会话会与对端
+    当前会话错位，表现为解密 InvalidTag。0 表示不做时效检查（仅测试用）。
+    """
     if len(hs) != HANDSHAKE_SIZE or hs[:9] != MAGIC_RATCHET:
         raise ValueError("bad handshake payload")
     eph_pub, ts, sig = hs[9:41], hs[41:49], hs[49:113]
     ed25519.Ed25519PublicKey.from_public_bytes(peer_ed_pub).verify(
         sig, MAGIC_RATCHET + eph_pub + ts)
+    if max_age > 0:
+        age = time.time() - struct.unpack("<Q", ts)[0]
+        if age > max_age or age < -max_age:      # 过龄或来自过远的未来都拒
+            raise HandshakeStale(f"handshake age {age:.0f}s outside ±{max_age:.0f}s")
     return eph_pub
 
 

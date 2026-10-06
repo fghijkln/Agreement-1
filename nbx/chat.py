@@ -131,6 +131,7 @@ class ChatSession:
         self.speaks_first = speaks_first
         self.session: RatchetSession | None = None
         self._pending: list[bytes] = []      # 等待握手期间取到、待后续处理的消息
+        self._hs_candidate: bytes | None = None  # _wait_handshake 的最新候选握手
 
     # ---------- 会话建立 ----------
 
@@ -147,15 +148,36 @@ class ChatSession:
         self.session = hs
 
     def _wait_handshake(self, timeout: float = 30.0) -> bytes:
+        """等对端握手，取时效最新的一个。
+
+        桶里可能堆积历代会话的握手残留（中继取走即清 + 7 天 TTL 意味着
+        对端多次重试会留下多代信封）。代际错配曾导致 InvalidTag——
+        因此这里丢弃过期握手（verify_handshake 的时效检查），并在一批
+        信封里选时间戳最新的握手，而不是"取到第一个就用"。
+        """
+        from .ratchet import HandshakeStale, handshake_age
         deadline = time.time() + timeout
         while time.time() < deadline:
             for blob in self.client.fetch(
                     self.my_fp, auth_proof(self.identity, self.my_fp)):
                 m = msg.parse_message(blob)
-                if m["ptype"] == msg.PT_HANDSHAKE:
-                    return m["body"]
-                # 正文先到（与握手同批）：缓存，poll_once 时解密
-                self._pending.append(blob)
+                if m["ptype"] != msg.PT_HANDSHAKE:
+                    # 正文先到（与握手同批）：缓存，poll_once 时解密
+                    self._pending.append(blob)
+                    continue
+                try:
+                    handshake_age(m["body"])     # 先做过期筛除
+                except HandshakeStale:
+                    continue                     # 旧代残留：丢弃
+                # 候选握手。记录最新的；旧候选已被过期筛除挡住，
+                # 同批多个新鲜握手（对端连发两轮）取 ts 较新者。
+                if (self._hs_candidate is None or
+                        handshake_age(m["body"]) <
+                        handshake_age(self._hs_candidate)):
+                    self._hs_candidate = m["body"]
+            if self._hs_candidate is not None:
+                body, self._hs_candidate = self._hs_candidate, None
+                return body
             time.sleep(1.0)
         raise TimeoutError("peer handshake not received in time")
 
