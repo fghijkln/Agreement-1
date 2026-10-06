@@ -42,12 +42,18 @@ def main(argv=None):
     cv.add_argument("infile")
     cv.add_argument("outfile")
     cv.add_argument("--encrypt", action="store_true", help="同时加密")
+    cv.add_argument("--compress", action="store_true", help="流级 LZMA 压缩")
     cv.add_argument("--keyfile", default="nbx.key")
 
     ex = sub.add_parser("extract", help="从 .nbx 无损还原原文件")
     ex.add_argument("infile")
     ex.add_argument("--outdir", default=".")
     ex.add_argument("--keyfile", default="nbx.key")
+
+    vw = sub.add_parser("view", help="终端直接查看 .nbx（不落盘）")
+    vw.add_argument("infile")
+    vw.add_argument("--keyfile", default="nbx.key")
+    vw.add_argument("--image", action="store_true", help="图片输出 base64 预览")
 
     bdl = sub.add_parser("bundle", help="把多个文件打成一个 .nbx")
     bdl.add_argument("outfile")
@@ -84,6 +90,9 @@ def main(argv=None):
     elif args.cmd == "convert":
         from . import carrier
         blob = carrier.convert(args.infile)
+        if args.compress:
+            meta, streams, flags = carrier.unpack(blob)
+            blob = carrier.pack(streams, meta, flags=flags, compress=True)
         if args.encrypt:
             master = _read_key(args.keyfile)
             meta, streams, flags = carrier.unpack(blob)
@@ -126,6 +135,17 @@ def main(argv=None):
             with open(out, "wb") as f:
                 f.write(streams[0][1])
             print(f"extracted -> {out} ({len(streams[0][1])} bytes, type={ctype})")
+
+    elif args.cmd == "view":
+        from . import viewer
+        with open(args.infile, "rb") as f:
+            blob = f.read()
+        master = None
+        try:
+            master = _read_key(args.keyfile)
+        except SystemExit:
+            pass
+        print(viewer.view(blob, master_key=master, image_preview=args.image))
 
     elif args.cmd == "bundle":
         from . import carrier

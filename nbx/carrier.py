@@ -58,9 +58,18 @@ def _build_payload(streams: list[tuple[int, bytes]]) -> bytes:
 
 
 def pack(streams: list[tuple[int, bytes]], meta: dict | None = None,
-         flags: int = 0) -> bytes:
-    """把多个流打包成一个 .nbx 容器（不加密）。"""
+         flags: int = 0, compress: bool = False) -> bytes:
+    """把多个流打包成一个 .nbx 容器。compress=True 时流级 LZMA 压缩。"""
     meta = dict(meta or {})
+    if compress:
+        import lzma
+        compressed = [(stype, lzma.compress(c, preset=6))
+                      for stype, c in streams]
+        # 仅当确实变小时才采用压缩
+        if sum(len(c) for _, c in compressed) < sum(len(c) for _, c in streams):
+            streams = compressed
+            flags |= FLAG_COMPRESSED
+            meta["comp"] = "lzma"
     if len(streams) > 1:
         flags |= FLAG_MULTIPART
     meta.setdefault("parts", [
@@ -113,6 +122,11 @@ def unpack(blob: bytes) -> tuple[dict, list[tuple[int, bytes]], int]:
             raise NBXError("truncated stream")
         streams.append((stype, payload[p:p + slen]))
         p += slen
+    # 自动解压
+    if flags & FLAG_COMPRESSED:
+        import lzma
+        streams = [(stype, lzma.decompress(c)) for stype, c in streams]
+        # parts 清单中记录的是原始长度
     return meta, streams, flags
 
 
