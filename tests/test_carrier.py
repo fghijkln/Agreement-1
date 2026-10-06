@@ -18,28 +18,28 @@ def test_text_roundtrip():
     print("✓ 文本 roundtrip")
 
 
-def test_file_conversion(tmp):
+def test_file_conversion(tmp_path):
     # 纯文本
-    f = tmp / "note.txt"; f.write_text("plain note", encoding="utf-8")
+    f = tmp_path / "note.txt"; f.write_text("plain note", encoding="utf-8")
     meta, streams, _ = carrier.unpack(carrier.convert(f))
     assert meta["type"] == "text" and streams[0][1] == b"plain note"
     # HTML
-    f = tmp / "page.html"; f.write_text("<h1>Hi</h1>", encoding="utf-8")
+    f = tmp_path / "page.html"; f.write_text("<h1>Hi</h1>", encoding="utf-8")
     meta, _, _ = carrier.unpack(carrier.convert(f))
     assert meta["type"] == "html"
     # PNG 魔数
-    f = tmp / "img.png"; f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+    f = tmp_path / "img.png"; f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
     meta, _, _ = carrier.unpack(carrier.convert(f))
     assert meta["type"] == "binary" and meta["mime"] == "image/png"
     # 未知二进制
-    f = tmp / "data.bin"; f.write_bytes(bytes(range(256)))
+    f = tmp_path / "data.bin"; f.write_bytes(bytes(range(256)))
     meta, _, _ = carrier.unpack(carrier.convert(f))
     assert meta["type"] == "binary" and meta["mime"] == "application/octet-stream"
     print("✓ 文件类型嗅探 (txt/html/png/bin)")
 
 
-def test_extract_lossless(tmp):
-    src = tmp / "orig.md"
+def test_extract_lossless(tmp_path):
+    src = tmp_path / "orig.md"
     src.write_text("# 标题\n\n内容 body。\n", encoding="utf-8")
     blob = carrier.convert(src)
     (name, content), = carrier.extract(blob)
@@ -48,9 +48,9 @@ def test_extract_lossless(tmp):
     print("✓ 无损还原")
 
 
-def test_bundle(tmp):
-    a = tmp / "a.txt"; a.write_text("file a")
-    b = tmp / "b.png"; b.write_bytes(b"\x89PNG\r\n\x1a\nIMGDATA")
+def test_bundle(tmp_path):
+    a = tmp_path / "a.txt"; a.write_text("file a")
+    b = tmp_path / "b.png"; b.write_bytes(b"\x89PNG\r\n\x1a\nIMGDATA")
     blob = carrier.convert_bundle([a, b], main_name="pack.nbx")
     meta, streams, flags = carrier.unpack(blob)
     assert meta["type"] == "bundle" and flags & carrier.FLAG_MULTIPART
@@ -61,9 +61,9 @@ def test_bundle(tmp):
     print("✓ 多文件 bundle")
 
 
-def test_encrypted_carrier(tmp):
+def test_encrypted_carrier(tmp_path):
     master = crypto.generate_master_key().encode()
-    secret = tmp / "secret.txt"
+    secret = tmp_path / "secret.txt"
     secret.write_text("top secret 内容", encoding="utf-8")
     blob = carrier.convert(str(secret))
     meta, streams, flags = carrier.unpack(blob)
@@ -96,9 +96,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as td:
         tmp = pathlib.Path(td)
         test_text_roundtrip()
-        test_file_conversion(tmp)
-        test_extract_lossless(tmp)
-        test_bundle(tmp)
-        test_encrypted_carrier(tmp)
+        test_file_conversion(tmp_path)
+        test_extract_lossless(tmp_path)
+        test_bundle(tmp_path)
+        test_encrypted_carrier(tmp_path)
         test_corruption()
     print("\n全部测试通过 ✅")

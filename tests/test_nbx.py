@@ -42,11 +42,14 @@ def test_roundtrip(tmp_path):
 
 
 def test_network_transfer(tmp_path):
+    """v2: convert -> send(自动E2E) -> 接收 -> extract 还原。"""
     keyfile = tmp_path / "k.key"
     src = tmp_path / "file.nbx"
     outdir = tmp_path / "recv"
     run("keygen", "--out", str(keyfile))
-    run("pack", __file__, str(src), "--keyfile", str(keyfile))
+    r = run("convert", str(Path(__file__)), str(src), "--encrypt",
+            "--keyfile", str(keyfile))
+    assert r.returncode == 0, r.stderr
 
     server = subprocess.Popen(
         [sys.executable, "-m", "nbx.cli", "listen", "9377",
@@ -57,15 +60,22 @@ def test_network_transfer(tmp_path):
         time.sleep(1.0)
         r = run("send", str(src), "127.0.0.1", "9377", "--keyfile", str(keyfile))
         assert r.returncode == 0, r.stderr
-        # 等 server 打印接收结果
         deadline = time.time() + 5
         while time.time() < deadline:
-            received = list(outdir.glob("decrypted_*"))
+            received = list(outdir.glob("*.nbx"))
             if received:
-                assert received[0].read_bytes() == Path(__file__).read_bytes()
+                restored = tmp_path / "restored"
+                r2 = run("extract", str(received[0]), "--outdir", str(restored),
+                         "--keyfile", str(keyfile))
+                if r2.returncode != 0:
+                    time.sleep(0.3)
+                    continue
+                got = list(restored.iterdir())[0].read_bytes()
+                assert got == Path(__file__).read_bytes()
                 break
             time.sleep(0.2)
         else:
-            raise AssertionError("decrypted file not received")
+            raise AssertionError("encrypted file not received")
     finally:
         server.terminate()
+        server.wait(timeout=5)

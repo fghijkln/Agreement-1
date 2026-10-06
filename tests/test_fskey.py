@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from nbx import fskey
 
 
-def test_roundtrip(tmp):
+def test_roundtrip(tmp_path):
     alice = fskey.Identity.generate()
     bob = fskey.Identity.generate()
     msg = "机密消息 forward secrecy test 🤫".encode()
@@ -20,7 +20,7 @@ def test_roundtrip(tmp):
     print("✓ 正常往返（Alice→Bob, 签名验证通过）")
 
 
-def test_wrong_sender_rejected(tmp):
+def test_wrong_sender_rejected(tmp_path):
     alice = fskey.Identity.generate()
     bob = fskey.Identity.generate()
     mallory = fskey.Identity.generate()
@@ -37,7 +37,7 @@ def test_wrong_sender_rejected(tmp):
     print("✓ 冒充发送方被拒绝（Ed25519 认证）")
 
 
-def test_tamper_rejected(tmp):
+def test_tamper_rejected(tmp_path):
     alice, bob = fskey.Identity.generate(), fskey.Identity.generate()
     env = bytearray(fskey.seal_envelope(b"data", alice,
                      *fskey.Identity.parse_public(bob.export_public())))
@@ -51,7 +51,7 @@ def test_tamper_rejected(tmp):
     print("✓ 密文篡改被拒绝")
 
 
-def test_forward_secrecy(tmp):
+def test_forward_secrecy(tmp_path):
     """核心性质：Bob 的静态私钥泄露后，旧信封仍无法解密。"""
     alice, bob = fskey.Identity.generate(), fskey.Identity.generate()
     msg = b"secret that must stay secret"
@@ -72,7 +72,7 @@ def test_forward_secrecy(tmp):
     print("✓ 前向保密结构成立（临时私钥不出现在信封/泄露材料中）")
 
 
-def test_envelope_size_stable(tmp):
+def test_envelope_size_stable(tmp_path):
     """信封头部长度恒定: 32(eph) + 64(sig) + 12(nonce) = 108B 开销。"""
     a, b = fskey.Identity.generate(), fskey.Identity.generate()
     env = fskey.seal_envelope(b"x", a, *fskey.Identity.parse_public(b.export_public()))
@@ -84,9 +84,9 @@ if __name__ == "__main__":
     import pathlib
     with tempfile.TemporaryDirectory() as td:
         tmp = pathlib.Path(td)
-        test_roundtrip(tmp)
-        test_wrong_sender_rejected(tmp)
-        test_tamper_rejected(tmp)
-        test_forward_secrecy(tmp)
-        test_envelope_size_stable(tmp)
+        test_roundtrip(tmp_path)
+        test_wrong_sender_rejected(tmp_path)
+        test_tamper_rejected(tmp_path)
+        test_forward_secrecy(tmp_path)
+        test_envelope_size_stable(tmp_path)
     print("\nFS 全部测试通过 ✅")
