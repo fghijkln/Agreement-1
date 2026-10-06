@@ -105,7 +105,9 @@ cd workers-relay && npx wrangler deploy       # Cloudflare Workers + Durable Obj
 tor onion service 指向任意上述实例             # 匿名部署，地址不可关联真实 IP
 ```
 
-参数一致：信封保存 7 天、每收件人队列上限 256、单信封 1 MiB、时间窗 ±300s。Python 客户端连 Workers 中继已互操作实测。
+参数一致：信封保存 7 天、每收件人队列上限 256、单信封 1 MiB、时间窗 ±300s。Python 客户端连 Workers 中继已互操作实测（正式账号部署：`https://nbx-relay.sctdjohn.workers.dev`）。
+
+Workers 部署注意：需 `CLOUDFLARE_API_TOKEN`（模板 "Edit Cloudflare Workers" 即可）；`workers.dev` 前置的 Cloudflare 防护会 403 拦截无 User-Agent 的请求，客户端须带 UA（`nbx.chat` 已内置 `NBX-Client/1.0`）。
 
 ## 三层传输栈
 
