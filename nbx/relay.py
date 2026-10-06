@@ -25,6 +25,7 @@ HTTP API（任意 ASGI/WSGI 可包，核心逻辑在 RelayStore + RelayLogic）�
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import struct
 import time
@@ -50,7 +51,7 @@ def _b64d(s: str) -> bytes:
 class RelayStore(Protocol):
     """存储抽象：内存版之外可换 SQLite / Workers KV / D1。"""
 
-    def put(self, recv_fp: bytes, envelope: bytes) -> None: ...
+    def put(self, recv_fp: bytes, envelope: bytes) -> bool: ...
     def pop_all(self, recv_fp: bytes) -> list[bytes]: ...
     def count(self, recv_fp: bytes) -> int: ...
 
@@ -62,18 +63,30 @@ class MemoryStore:
         self.ttl = ttl
         self.max_per_fp = max_per_fp
         self._q: dict[bytes, list[tuple[float, bytes]]] = {}
+        self._seen: dict[bytes, float] = {}     # msg_id -> 入队时间（幂等去重）
 
     def _gc(self, fp: bytes):
         now = time.time()
         q = self._q.get(fp, [])
         self._q[fp] = [(t, e) for t, e in q if now - t < self.ttl]
+        self._seen = {mid: t for mid, t in self._seen.items() if now - t < self.ttl}
 
-    def put(self, recv_fp: bytes, envelope: bytes) -> None:
+    def put(self, recv_fp: bytes, envelope: bytes) -> bool:
+        """入队。返回 False 表示重复信封（同 msg_id），已忽略。
+
+        幂等去重：客户端在网络抖动下重发同一信封（POST 无响应重试）时，
+        中继侧只收一件——否则重复投递会让 ratchet 解密侧产生无谓的失败。
+        """
+        mid = envelope[:8] + hashlib.blake2b(envelope, digest_size=16).digest()
         self._gc(recv_fp)
+        if mid in self._seen:
+            return False
+        self._seen[mid] = time.time()
         q = self._q.setdefault(recv_fp, [])
         q.append((time.time(), envelope))
         if len(q) > self.max_per_fp:            # 满了丢最旧
             self._q[recv_fp] = q[-self.max_per_fp:]
+        return True
 
     def pop_all(self, recv_fp: bytes) -> list[bytes]:
         self._gc(recv_fp)

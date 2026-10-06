@@ -35,6 +35,28 @@ def _http_req(url: str, data: bytes | None = None, method: str = "GET"):
     return req
 
 
+def _urlopen_retry(req, timeout: float = 10, attempts: int = 5):
+    """带重试的 urlopen。
+
+    针对受审查网络下 TLS 握手被随机重置 (ConnectionReset / SSL EOF):
+    同一请求原样重发是安全的——GET 幂等, POST 信封有 msg_id 去重语义
+    (重复投递同一信封在中继侧无害, 收件人 ratchet 侧由重放防护兜底)。
+    """
+    delay = 1.0
+    for i in range(attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            # HTTPError (4xx/5xx) 是服务端明确响应, 不该重试
+            if isinstance(e, urllib.error.HTTPError):
+                raise
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    raise RuntimeError("unreachable")
+
+
 def _b64e(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
@@ -61,7 +83,7 @@ class RelayClient:
 
     def post_envelope(self, blob: bytes) -> dict:
         req = _http_req(self.base + "/envelope", data=blob, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with _urlopen_retry(req) as r:
             return json.loads(r.read())
 
     def auth(self, identity: Identity, fp: bytes) -> None:
@@ -76,7 +98,7 @@ class RelayClient:
                            fromlist=["PublicFormat"]).PublicFormat.Raw)
         body = fp + ts + ed_pub + identity.ed_priv.sign(AUTH_INFO + fp + ts)
         req = _http_req(self.base + "/auth", data=body, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with _urlopen_retry(req) as r:
             obj = json.loads(r.read())
         if not obj.get("ok"):
             raise PermissionError(f"relay auth failed: {obj}")
@@ -84,7 +106,7 @@ class RelayClient:
     def fetch(self, fp: bytes, proof: bytes) -> list[bytes]:
         url = f"{self.base}/inbox/{_b64e(fp)}?proof={_b64e(proof)}"
         try:
-            with urllib.request.urlopen(_http_req(url), timeout=10) as r:
+            with _urlopen_retry(_http_req(url)) as r:
                 obj = json.loads(r.read())
             return [_b64d(e) for e in obj.get("envelopes", [])]
         except urllib.error.HTTPError as e:
