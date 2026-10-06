@@ -52,13 +52,20 @@ def _pack(ptype, sfp, rfp, body=b""):
     return msg.pack_message(ptype, sfp, rfp, body)
 
 
+def _proof_of(i: Identity, env: bytes) -> bytes:
+    """构造投递签名后缀（ts||sig），签名覆盖明文头。"""
+    import struct as _s
+    ts = _s.pack("<Q", int(time.time()))
+    return ts + i.ed_priv.sign(b"nbx-relay-auth-v1" + env[:msg.HEADER_SIZE] + ts)
+
+
 # ---------- RelayLogic 单元 ----------
 
 def test_accept_and_fetch_roundtrip(tmp_path):
     logic = RelayLogic(MemoryStore())
     alice_fp, bob_fp = b"A" * 8, b"B" * 8
     env = _pack(msg.PT_TEXT, alice_fp, bob_fp, b"ciphertext-here")
-    r = logic.accept(env)
+    r = logic.accept(env, verify=False)
     assert r["ok"] is True
     assert logic.inbox_count(bob_fp) == 1
     assert logic.inbox_count(alice_fp) == 0
@@ -98,7 +105,7 @@ def test_ttl_expiry(tmp_path):
     store = MemoryStore(ttl=1)
     logic = RelayLogic(store)
     env = _pack(msg.PT_TEXT, b"A" * 8, b"B" * 8, b"x")
-    logic.accept(env)
+    logic.accept(env, verify=False)
     # 手工把入队时间拨回 2 小时前
     store._q[b"B" * 8][0] = (time.time() - 7200, env)
     assert logic.inbox_count(b"B" * 8) == 0        # gc 清掉
@@ -109,7 +116,8 @@ def test_ttl_expiry(tmp_path):
 def test_queue_cap_drops_oldest(tmp_path):
     logic = RelayLogic(MemoryStore(max_per_fp=5))
     for i in range(8):
-        logic.accept(_pack(msg.PT_TEXT, b"A" * 8, b"B" * 8, f"m{i}".encode()))
+        logic.accept(_pack(msg.PT_TEXT, b"A" * 8, b"B" * 8, f"m{i}".encode()),
+                     verify=False)
     envs = logic.store.pop_all(b"B" * 8)
     assert len(envs) == 5
     bodies = [msg.parse_message(e)["body"] for e in envs]
@@ -146,7 +154,8 @@ def test_fetch_requires_auth_and_clears(tmp_path):
     logic = RelayLogic(MemoryStore())
     alice, fp = _setup_auth(logic)
     for i in range(3):
-        logic.accept(_pack(msg.PT_TEXT, b"S" * 8, fp, f"n{i}".encode()))
+        logic.accept(_pack(msg.PT_TEXT, b"S" * 8, fp, f"n{i}".encode()),
+                     verify=False)
     # 未授权 → 拒
     try:
         logic.fetch(fp, b"")
@@ -187,9 +196,12 @@ def test_http_endpoints(tmp_path):
     # health
     status, obj = handler("GET", "/health", b"")
     assert status == 200 and obj["ok"]
-    # 投递
-    env = _pack(msg.PT_TEXT, b"S" * 8, fp, b"hello relay")
-    status, obj = handler("POST", "/envelope", env)
+    # 投递（audit R-06：先登记发送者，再附投递签名）
+    sender = Identity.generate()
+    sender_fp = _fp_of(sender)
+    logic.register_pubkey(_raw_pub(sender))
+    env = _pack(msg.PT_TEXT, sender_fp, fp, b"hello relay")
+    status, obj = handler("POST", "/envelope", env + _proof_of(sender, env))
     assert status == 202 and obj["ok"]
     # 坏信封 → 400
     status, obj = handler("POST", "/envelope", b"garbage")
@@ -253,7 +265,7 @@ def test_e2e_via_relay(tmp_path):
     for text in ("hi", "offline msg", "third"):
         wire = msg.pack_message(msg.PT_TEXT, a_fp, b_fp,
                                 a.encrypt(text.encode()))
-        assert logic.accept(wire)["ok"]
+        assert logic.accept(wire + _proof_of(alice_id, wire))["ok"]
 
     # Bob 上线：签名取信 → 解密
     pulled = logic.fetch(b_fp, _auth_proof(bob_id, b_fp))
@@ -262,9 +274,11 @@ def test_e2e_via_relay(tmp_path):
     assert texts == [b"hi", b"offline msg", b"third"]
 
     # Bob 回信 + 已读回执 → Alice 取
-    logic.accept(msg.pack_message(msg.PT_TEXT, b_fp, a_fp, b.encrypt(b"got it")))
-    logic.accept(msg.pack_message(msg.PT_READ, b_fp, a_fp,
-                                  b.encrypt(msg.encode_read(msg.parse_message(pulled[0])["msg_id"]))))
+    w1 = msg.pack_message(msg.PT_TEXT, b_fp, a_fp, b.encrypt(b"got it"))
+    logic.accept(w1 + _proof_of(bob_id, w1))
+    w2 = msg.pack_message(msg.PT_READ, b_fp, a_fp,
+                          b.encrypt(msg.encode_read(msg.parse_message(pulled[0])["msg_id"])))
+    logic.accept(w2 + _proof_of(bob_id, w2))
     inbox = logic.fetch(a_fp, _auth_proof(alice_id, a_fp))
     assert len(inbox) == 2
     parsed = [msg.parse_message(e) for e in inbox]
@@ -307,6 +321,55 @@ def test_http_auth_endpoint(tmp_path):
     fp_other = base64.urlsafe_b64decode(obj2["fp"] + "=" * (-len(obj2["fp"]) % 4))
     assert fp_other != fp, "不同钥匙必须得到不同 fp"
     print("✓ /auth 端点：登记/服务器算 fp/坏签名/错长度/抢注不成立")
+
+
+def test_unauthenticated_sender_cannot_fill_queue(tmp_path):
+    """R-06 攻击回归：未 AUTH 登记的发送者投递被拒，无法灌满收件桶。"""
+    logic = RelayLogic(MemoryStore())
+    mallory = Identity.generate()
+    bob_fp = _fp_of(Identity.generate())
+    env = _pack(msg.PT_TEXT, _fp_of(mallory), bob_fp, b"spam")
+    for _ in range(300):                       # 超过队列上限 256 的灌桶尝试
+        try:
+            logic.accept(env + _proof_of(mallory, env))
+        except ValueError:
+            break                              # 未登记 → 立即拒
+    else:
+        raise AssertionError("unauthenticated spam accepted")
+    assert logic.inbox_count(bob_fp) == 0
+    print("✓ R-06：未认证发送者无法投递（灌桶不成立）")
+
+
+def test_authenticated_sender_per_fp_quota(tmp_path):
+    """R-06 配套：认证发送者也不能用自己的钥匙灌爆单个收件桶。"""
+    logic = RelayLogic(MemoryStore(max_per_fp=50))
+    mallory = Identity.generate()
+    logic.register_pubkey(_raw_pub(mallory))
+    bob_fp = _fp_of(Identity.generate())
+    for i in range(100):                       # 尝试灌 100 封
+        env = _pack(msg.PT_TEXT, _fp_of(mallory), bob_fp, f"m{i}".encode())
+        logic.accept(env + _proof_of(mallory, env))
+    envs = logic.store.pop_all(bob_fp)
+    assert len(envs) <= 50, "队列上限必须生效"
+    print("✓ R-06：认证发送者同样受队列上限约束")
+
+
+def test_global_envelope_budget(tmp_path):
+    """R-07 攻击回归：全局信封总量/字节数有上限，多收件人不能绕过。"""
+    logic = RelayLogic(MemoryStore(max_total_bytes=4096))
+    mallory = Identity.generate()
+    logic.register_pubkey(_raw_pub(mallory))
+    accepted = 0
+    for i in range(64):                        # 64 个不同收件人 × 512B
+        recv = bytes([i]) + b"\x01" * 7
+        env = _pack(msg.PT_TEXT, _fp_of(mallory), recv, b"x" * 512)
+        try:
+            logic.accept(env + _proof_of(mallory, env))
+            accepted += 1
+        except ValueError:
+            break
+    assert accepted < 64, "全局字节预算必须封顶"
+    print(f"✓ R-07：全局预算生效（{accepted}/64 封后拒绝）")
 
 
 def test_fp_hijack_rejected(tmp_path):

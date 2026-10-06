@@ -211,10 +211,18 @@ class TransportStack:
             base = addr.rstrip("/")
             if base not in self._relay_authed:
                 self._relay_auth(base)
-            status, _ = self._http_post(base + "/envelope", blob, None)
+            status, _ = self._http_post(base + "/envelope",
+                                        blob + self._delivery_proof(blob), None)
             return TransportResult(LAYER_RELAY, status == 202, f"HTTP {status}")
         except Exception as e:
             return TransportResult(LAYER_RELAY, False, str(e))
+
+    def _delivery_proof(self, blob: bytes) -> bytes:
+        """信封投递签名（audit R-06）：中继拒收未认证投递。"""
+        import struct as _s
+        ts = _s.pack("<Q", int(time.time()))
+        hdr = blob[:msg.HEADER_SIZE]
+        return ts + self.me.ed_priv.sign(b"nbx-relay-auth-v1" + hdr + ts)
 
     def _relay_auth(self, base: str):
         """TOFU 登记本方公钥（audit R-03：发送 64B 公钥材料，fp 由服务器算）。"""
@@ -239,8 +247,9 @@ class TransportStack:
             host, port = onion_addr.replace("http://", "").rsplit(":", 1)
             # Tor 的 DNS/连接走 SOCKS5；用原始 socket 发 HTTP/1.0 请求
             s = self._socks_connect(host, int(port))
+            data = blob + self._delivery_proof(blob)
             http = (f"POST /envelope HTTP/1.0\r\nHost: {onion_addr}\r\n"
-                    f"Content-Length: {len(blob)}\r\n\r\n").encode() + blob
+                    f"Content-Length: {len(data)}\r\n\r\n").encode() + data
             s.sendall(http)
             resp = b""
             while True:
@@ -276,9 +285,10 @@ class TransportStack:
         """TCP 直连对端 mini-relay（host:port）。"""
         try:
             host, port = addr.rsplit(":", 1)
+            data = blob + self._delivery_proof(blob)
             with socket.create_connection((host, int(port)), timeout=5) as s:
                 http = (f"POST /envelope HTTP/1.0\r\nHost: {host}\r\n"
-                        f"Content-Length: {len(blob)}\r\n\r\n").encode() + blob
+                        f"Content-Length: {len(data)}\r\n\r\n").encode() + data
                 s.sendall(http)
                 resp = s.recv(4096)
             ok = b" 202 " in resp.split(b"\r\n")[0] if resp else False

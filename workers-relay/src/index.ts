@@ -137,17 +137,43 @@ export default {
     }
 
     if (req.method === "POST" && url.pathname === "/envelope") {
+      // audit R-06：信封末尾必须附投递签名 (ts(8)+sig(64))，
+      // sig = Ed25519_sign(AUTH_INFO || 明文头(48B) || ts)，发送者须先 AUTH 登记。
+      // 否则任何知道 recv_fp 的人都能匿名灌满队列挤掉合法消息。
       const body = new Uint8Array(await req.arrayBuffer());
       if (body.length > MAX_ENVELOPE) return json(400, { ok: false, error: "envelope too large" });
-      const hdr = parseHeader(body);
+      if (body.length < 48 + 72) return json(400, { ok: false, error: "missing sender proof" });
+      const envLen = body.length - 72;
+      const hdr = parseHeader(body.slice(0, envLen));
       if (!hdr) return json(400, { ok: false, error: "bad envelope" });
       if (hdr.ptype === 0) return json(400, { ok: false, error: "invalid ptype" });
       if (b64urlEncode(hdr.senderFp) === b64urlEncode(hdr.recvFp))
         return json(400, { ok: false, error: "self-addressed" });
+      // R-06: 验证发送者签名（发送者须已 AUTH 登记）
+      {
+        const senderFpB64 = b64urlEncode(hdr.senderFp);
+        const senderId = env.NBX_FP.idFromName(senderFpB64);
+        const senderStub = env.NBX_FP.get(senderId);
+        const pubResp = await senderStub.fetch("https://do/pubkey");
+        if (!pubResp.ok) return json(403, { ok: false, error: "sender not registered (auth first)" });
+        const senderEd = new Uint8Array(await pubResp.arrayBuffer());
+        if (senderEd.length !== 32) return json(403, { ok: false, error: "sender not registered" });
+        const tsBytes = body.slice(envLen, envLen + 8);
+        const sigBytes = body.slice(envLen + 8);
+        const ts = new DataView(tsBytes.buffer, tsBytes.byteOffset, 8).getBigUint64(0, true);
+        const nowS = BigInt(Math.floor(Date.now() / 1000));
+        if (ts > nowS + BigInt(AUTH_SKEW_S) || ts < nowS - BigInt(AUTH_SKEW_S))
+          return json(403, { ok: false, error: "sender proof timestamp out of window" });
+        const msgBytes = concat(new TextEncoder().encode(AUTH_INFO),
+          body.slice(0, 48), tsBytes);
+        if (!await ed25519Verify(senderEd, sigBytes, msgBytes))
+          return json(403, { ok: false, error: "bad sender proof" });
+      }
+      // 入队存裸信封（不带投递签名后缀），收件方无需感知
       const id = env.NBX_FP.idFromName(b64urlEncode(hdr.recvFp));
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/push", {
-        method: "POST", body: body as BodyInit,
+        method: "POST", body: body.slice(0, envLen) as BodyInit,
       });
       return json(resp.status === 202 ? 202 : 400, await resp.json());
     }

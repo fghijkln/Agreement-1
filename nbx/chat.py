@@ -88,6 +88,17 @@ def raw_public(identity: Identity) -> bytes:
     return x_pub + ed_pub
 
 
+def delivery_proof(sender_identity, header: bytes) -> bytes:
+    """信封投递签名（audit R-06）：ts(8) + Ed25519_sign(AUTH_INFO||header||ts)。
+
+    追加在信封末尾；中继用 AUTH 登记的发送者公钥验证。未认证投递
+    被拒——封堵"匿名灌满收件桶挤掉合法消息"。
+    """
+    import struct as _s
+    ts = _s.pack("<Q", int(time.time()))
+    return ts + sender_identity.ed_priv.sign(AUTH_INFO + header + ts)
+
+
 def auth_proof(identity: Identity, fp: bytes) -> bytes:
     ts = struct.pack("<Q", int(time.time()))
     return ts + identity.ed_priv.sign(AUTH_INFO + fp + ts)
@@ -99,8 +110,10 @@ class RelayClient:
     def __init__(self, base: str):
         self.base = base.rstrip("/")
 
-    def post_envelope(self, blob: bytes) -> dict:
-        req = _http_req(self.base + "/envelope", data=blob, method="POST")
+    def post_envelope(self, blob: bytes, proof: bytes | None = None) -> dict:
+        # audit R-06：proof = delivery_proof(...)，中继验证发送者签名
+        data = blob + proof if proof else blob
+        req = _http_req(self.base + "/envelope", data=data, method="POST")
         with _urlopen_retry(req) as r:
             return json.loads(r.read())
 
@@ -163,8 +176,10 @@ class ChatSession:
         self.client.auth(self.identity, self.my_fp)
         hs = RatchetSession()
         payload = hs.begin(self.identity, self.my_fp, self.peer_fp)
-        self.client.post_envelope(msg.pack_message(
-            msg.PT_HANDSHAKE, self.my_fp, self.peer_fp, payload))
+        hs_wire = msg.pack_message(
+            msg.PT_HANDSHAKE, self.my_fp, self.peer_fp, payload)
+        self.client.post_envelope(
+            hs_wire, delivery_proof(self.identity, hs_wire[:msg.HEADER_SIZE]))
         peer_hs = self._wait_handshake()
         hs.finish(self.identity, self.peer_ed_pub, peer_hs,
                   speaks_first=self.speaks_first,
@@ -214,7 +229,8 @@ class ChatSession:
             text.encode("utf-8"), outer_aad=msg.routing_aad(
                 msg.PT_TEXT, self.my_fp, self.peer_fp))
         wire = msg.pack_message(msg.PT_TEXT, self.my_fp, self.peer_fp, inner)
-        self.client.post_envelope(wire)
+        self.client.post_envelope(
+            wire, delivery_proof(self.identity, wire[:msg.HEADER_SIZE]))
         return wire
 
     def poll_once(self) -> list[tuple[int, str]]:

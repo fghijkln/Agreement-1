@@ -17,7 +17,7 @@ class OfflineClient:
     def auth(self, *a, **k):
         pass
 
-    def post_envelope(self, blob):
+    def post_envelope(self, blob, proof=None):
         self.posted.append(blob)
         return {"ok": True}
 

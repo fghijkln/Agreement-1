@@ -37,6 +37,7 @@ from .message import parse_message, HEADER_SIZE
 DEFAULT_TTL = 7 * 86400          # 信封保存 7 天
 DEFAULT_MAX_PER_FP = 256         # 每个指纹队列上限
 MAX_ENVELOPE = 1 << 20           # 单信封 1 MiB（大文件走 FILE_OFFER + 外部 blob）
+DEFAULT_MAX_TOTAL_BYTES = 256 * (1 << 20)   # audit R-07：全局在存字节预算 256 MiB
 
 AUTH_INFO = b"nbx-relay-auth-v1"
 
@@ -60,16 +61,22 @@ class RelayStore(Protocol):
 class MemoryStore:
     """内存实现：{recv_fp: [(enqueued_at, envelope), ...]}。"""
 
-    def __init__(self, ttl: int = DEFAULT_TTL, max_per_fp: int = DEFAULT_MAX_PER_FP):
+    def __init__(self, ttl: int = DEFAULT_TTL, max_per_fp: int = DEFAULT_MAX_PER_FP,
+                 max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES):
         self.ttl = ttl
         self.max_per_fp = max_per_fp
+        self.max_total_bytes = max_total_bytes   # audit R-07：全局字节预算
         self._q: dict[bytes, list[tuple[float, bytes]]] = {}
         self._seen: dict[bytes, float] = {}     # msg_id -> 入队时间（幂等去重）
+        self._total_bytes = 0
 
     def _gc(self, fp: bytes):
         now = time.time()
         q = self._q.get(fp, [])
-        self._q[fp] = [(t, e) for t, e in q if now - t < self.ttl]
+        kept = [(t, e) for t, e in q if now - t < self.ttl]
+        for _, e in q[len(kept):]:
+            self._total_bytes -= len(e)
+        self._q[fp] = kept
         self._seen = {mid: t for mid, t in self._seen.items() if now - t < self.ttl}
 
     def put(self, recv_fp: bytes, envelope: bytes) -> bool:
@@ -83,15 +90,25 @@ class MemoryStore:
         if mid in self._seen:
             return False
         self._seen[mid] = time.time()
+        # audit R-07：全局字节预算——"每收件人 256 条"挡不住"制造一百万
+        # 个收件人"，必须对在存总量封顶（超过时拒绝新投递，403/400 上抛）
+        if self._total_bytes + len(envelope) > self.max_total_bytes:
+            raise ValueError("global envelope budget exceeded")
+        self._total_bytes += len(envelope)
         q = self._q.setdefault(recv_fp, [])
         q.append((time.time(), envelope))
         if len(q) > self.max_per_fp:            # 满了丢最旧
+            dropped = q[:-self.max_per_fp]
             self._q[recv_fp] = q[-self.max_per_fp:]
+            for _, e in dropped:
+                self._total_bytes -= len(e)
         return True
 
     def pop_all(self, recv_fp: bytes) -> list[bytes]:
         self._gc(recv_fp)
         out = [e for _, e in self._q.get(recv_fp, [])]
+        for e in out:
+            self._total_bytes -= len(e)
         self._q[recv_fp] = []
         return out
 
@@ -105,22 +122,55 @@ class RelayLogic:
 
     def __init__(self, store: RelayStore,
                  ttl: int = DEFAULT_TTL,
-                 max_per_fp: int = DEFAULT_MAX_PER_FP):
+                 max_per_fp: int = DEFAULT_MAX_PER_FP,
+                 max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES):
         self.store = store
         self.ttl = ttl
         self.max_per_fp = max_per_fp
+        self.max_total_bytes = max_total_bytes   # audit R-07：全局字节预算
         self._pubkeys: dict[bytes, bytes] = {}   # fp -> ed25519 公钥（AUTH 登记）
 
     # ---------- 投递 ----------
 
-    def accept(self, blob: bytes) -> dict:
-        """校验并投递一封信。返回 {'ok': True, 'msg_id': ...} 或抛 ValueError。"""
+    def verify_sender(self, blob: bytes, envelope_len: int,
+                      now_skew: int = 300) -> bytes:
+        """校验信封发送者签名（audit R-06），返回发送者 fp。
+
+        信封 = 明文头(48) + 密文体 + 投递签名(72: ts(8)+sig(64))。
+        sig = Ed25519_sign(AUTH_INFO || 明文头(48B) || ts)。
+        未认证的投递被拒——否则任何知道 recv_fp 的人都能匿名灌满
+        256 条队列，把合法离线消息挤掉（无需知道任何密钥）。
+        """
+        sender_fp = blob[12:20]
+        if envelope_len < HEADER_SIZE + 72:
+            raise ValueError("missing sender proof")
+        ts = blob[envelope_len - 72:envelope_len - 64]
+        sig = blob[envelope_len - 64:]
+        if abs(time.time() - struct.unpack("<Q", ts)[0]) > now_skew:
+            raise ValueError("sender proof timestamp out of window")
+        ed_pub = self._pubkeys.get(sender_fp)
+        if ed_pub is None:
+            raise ValueError("sender not registered (auth first)")
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(
+                sig, AUTH_INFO + blob[:HEADER_SIZE] + ts)
+        except Exception:
+            raise ValueError("bad sender proof")
+        return sender_fp
+
+    def accept(self, blob: bytes, verify: bool = True) -> dict:
+        """校验并投递一封信。返回 {'ok': True, 'msg_id': ...} 或抛 ValueError。
+
+        verify=False 仅用于测试（老测试与新测试构造裸信封）。
+        """
         if len(blob) > MAX_ENVELOPE:
             raise ValueError("envelope too large")
         if len(blob) < HEADER_SIZE:
             raise ValueError("envelope too short")
         try:
-            m = parse_message(blob)
+            m = parse_message(blob[:HEADER_SIZE] + blob[HEADER_SIZE:-72]
+                              if verify else blob)
         except ValueError as e:
             raise ValueError(f"bad envelope: {e}")
         if m["ptype"] == 0:                      # 0 不是合法 ptype
@@ -128,6 +178,9 @@ class RelayLogic:
         recv_fp = m["recv_fp"]
         if recv_fp == m["sender_fp"]:
             raise ValueError("self-addressed")
+        if verify:
+            self.verify_sender(blob, len(blob))
+            blob = blob[:-72]              # 入队存裸信封，收件方无感
         self.store.put(recv_fp, blob)
         return {"ok": True, "msg_id": _b64e(m["msg_id"]), "ptype": m["ptype"]}
 
