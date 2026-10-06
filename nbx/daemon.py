@@ -143,7 +143,7 @@ class Daemon:
     """常驻会话服务。UI 通过 IPC 与之通信，daemon 独立生命周期。"""
 
     def __init__(self, state_dir: str, relay_url: str,
-                 poll_interval: float = 3.0):
+                 poll_interval: float = 3.0, passphrase: str | None = None):
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "messages").mkdir(exist_ok=True)
@@ -152,12 +152,25 @@ class Daemon:
         self.poll_interval = poll_interval
 
         id_path = self.state_dir / "identity.key"
-        if id_path.exists():
+        # audit R-13: 身份私钥加密落盘（NBXID1 格式）。优先读加密格式；
+        # 发现旧明文文件则加载并迁移为加密格式（passphrase 非空时）。
+        enc_path = self.state_dir / "identity.key.enc"
+        if enc_path.exists() and passphrase:
+            self.identity = Identity.load_encrypted(str(enc_path), passphrase)
+        elif id_path.exists():
             self.identity = Identity.load(str(id_path))
+            if passphrase:
+                self.identity.save_encrypted(str(enc_path), passphrase)
+                os.chmod(enc_path, 0o600)
+                id_path.unlink()               # 迁移后移除明文
         else:
             self.identity = Identity.generate()
-            self.identity.save(str(id_path))
-            os.chmod(id_path, 0o600)
+            if passphrase:
+                self.identity.save_encrypted(str(enc_path), passphrase)
+                os.chmod(enc_path, 0o600)
+            else:
+                self.identity.save(str(id_path))
+                os.chmod(id_path, 0o600)
         self.my_fp = fingerprint8(self.identity.export_public())
         self.client = RelayClient(relay_url)
         self.contacts: dict[str, ContactSession] = {}   # peer_pub_b64 -> CS

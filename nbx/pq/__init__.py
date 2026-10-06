@@ -83,6 +83,35 @@ class PQIdentity:
         with open(path, "rb") as f:
             return cls.from_bytes(base64.b64decode(f.read().strip()))
 
+    # ---- audit R-13: 口令加密落盘 (scrypt + ChaCha20-Poly1305) ----
+    MAGIC_ENC = b"NBXPQ1"
+
+    def save_encrypted(self, path: str, passphrase: str):
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+        import secrets
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        salt = secrets.token_bytes(16)
+        key = Scrypt(salt=salt, length=32, n=2 ** 15, r=8, p=1).derive(passphrase.encode("utf-8"))
+        nonce = secrets.token_bytes(12)
+        ct = ChaCha20Poly1305(key).encrypt(nonce, self.to_bytes(), None)
+        blob = self.MAGIC_ENC + bytes([15, 8, 1]) + salt + nonce + ct
+        with open(path, "wb") as f:
+            f.write(base64.b64encode(blob) + b"\n")
+
+    @classmethod
+    def load_encrypted(cls, path: str, passphrase: str) -> "PQIdentity":
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        with open(path, "rb") as f:
+            blob = base64.b64decode(f.read().strip())
+        if blob[:6] != cls.MAGIC_ENC:          # MAGIC 为 6 字节
+            raise ValueError("not an encrypted identity file")
+        n_exp, r_exp, p_exp = blob[6], blob[7], blob[8]
+        salt, nonce, ct = blob[9:25], blob[25:37], blob[37:]
+        key = Scrypt(salt=salt, length=32, n=1 << n_exp, r=r_exp, p=p_exp).derive(
+            passphrase.encode("utf-8"))
+        return cls.from_bytes(ChaCha20Poly1305(key).decrypt(nonce, ct, None))
+
     # ---- 公钥导出（X25519 pub + Ed25519 pub + KEM ek，全部定长拼接） ----
     def export_public(self) -> str:
         x_pub = self.x_priv.public_key().public_bytes(

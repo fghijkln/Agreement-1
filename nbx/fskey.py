@@ -56,6 +56,7 @@ class Identity:
                    ed25519.Ed25519PrivateKey.from_private_bytes(data[32:64]))
 
     def save(self, path: str):
+        """明文保存。audit R-13 不推荐, 仅为兼容; 新代码用 save_encrypted。"""
         import base64
         with open(path, "w", encoding="utf-8") as f:
             f.write(base64.b64encode(self.to_bytes()).decode() + "\n")
@@ -65,6 +66,39 @@ class Identity:
         import base64
         with open(path, "r", encoding="utf-8") as f:
             return cls.from_bytes(base64.b64decode(f.read().strip()))
+
+    # ---- audit R-13: 口令加密落盘 (scrypt 派生 + ChaCha20-Poly1305) ----
+    MAGIC_ENC = b"NBXID1"
+
+    def save_encrypted(self, path: str, passphrase: str):
+        """身份私钥加密落盘: scrypt(passphrase) 派生密钥, 防磁盘直接窃取。"""
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+        import base64, secrets
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        salt = secrets.token_bytes(16)
+        kdf = Scrypt(salt=salt, length=32, n=2 ** 15, r=8, p=1)
+        key = kdf.derive(passphrase.encode("utf-8"))
+        nonce = secrets.token_bytes(12)
+        ct = ChaCha20Poly1305(key).encrypt(nonce, self.to_bytes(), None)
+        blob = self.MAGIC_ENC + bytes([15, 8, 1]) + salt + nonce + ct  # n=2^15,r=8,p=1
+        with open(path, "wb") as f:
+            f.write(base64.b64encode(blob) + b"\n")
+
+    @classmethod
+    def load_encrypted(cls, path: str, passphrase: str) -> "Identity":
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        with open(path, "rb") as f:
+            blob = base64.b64decode(f.read().strip())
+        if blob[:6] != cls.MAGIC_ENC:          # MAGIC 为 6 字节
+            raise ValueError("not an encrypted identity file")
+        n_exp, r_exp, p_exp = blob[6], blob[7], blob[8]
+        salt, nonce, ct = blob[9:25], blob[25:37], blob[37:]
+        kdf = Scrypt(salt=salt, length=32, n=1 << n_exp, r=r_exp, p=p_exp)
+        key = kdf.derive(passphrase.encode("utf-8"))
+        data = ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+        return cls.from_bytes(data)
 
     @classmethod
     def generate(cls) -> "Identity":
