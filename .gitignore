@@ -3,3 +3,7 @@ __pycache__/
 *.key
 received/
 .nbx/
+dist/
+build/
+app/build/
+app/dist/
