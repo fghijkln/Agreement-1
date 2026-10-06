@@ -289,8 +289,18 @@ class RatchetSession:
         # 完整性校验（audit ⑤）：tag 必须与 root_key 绑定的 TLV 序列一致
         if 8 not in fields or len(fields[8]) != 16:
             raise ValueError("ratchet state missing integrity tag")
-        body = raw[:raw.rfind(bytes([8]) + struct.pack("<I", 16))]
-        if _state_integrity_tag(s._root_key, body) != fields[8]:
+        # 精确定位 tag 字段头（此前用 rfind 反推，skipped 密文碰巧含
+        # 相同字节序列时会切错位置）：重放 TLV 解析到字段 8 之前
+        body_end = mlen + 1
+        while body_end < len(raw):
+            t = raw[body_end]
+            if t == 8:
+                break
+            ln = struct.unpack("<I", raw[body_end + 1:body_end + 5])[0]
+            body_end += 5 + ln
+        else:
+            raise ValueError("ratchet state missing integrity tag")
+        if _state_integrity_tag(s._root_key, raw[:body_end]) != fields[8]:
             raise ValueError("ratchet state integrity check failed "
                              "(corrupted or foreign state file)")
         s._established = True
@@ -432,3 +442,12 @@ class RatchetSession:
     @property
     def skipped_count(self) -> int:
         return len(self._skipped)
+
+    @property
+    def recv_n(self) -> int:
+        """已收消息步数（audit R2-04: daemon 层单调 epoch 检测用）。"""
+        return self._recv_n
+
+    @property
+    def send_n(self) -> int:
+        return self._send_n

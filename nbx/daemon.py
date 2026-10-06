@@ -138,6 +138,13 @@ class ContactSession:
         return text
 
 
+
+def _progress_of(session) -> int:
+    """audit R2-04: 会话进度标量。非 RatchetSession（测试 stub）按 0 处理。"""
+    recv_n = getattr(session, "recv_n", 0)
+    send_n = getattr(session, "send_n", 0)
+    return recv_n * (1 << 20) + send_n
+
 class Daemon:
     """常驻会话服务。UI 通过 IPC 与之通信，daemon 独立生命周期。"""
 
@@ -210,6 +217,10 @@ class Daemon:
     def _session_path(self, cs: ContactSession) -> Path:
         return self.state_dir / "sessions" / f"{_b64e(cs.peer_fp)}.session"
 
+    def _epoch_log_path(self, peer_fp: bytes) -> Path:
+        """audit R2-04: 只追加的单调 epoch 日志（每对端一个）。"""
+        return self.state_dir / "sessions" / f"{_b64e(peer_fp)}.epoch"
+
     def save_session(self, cs: ContactSession) -> None:
         if cs.session is None:
             return
@@ -218,6 +229,13 @@ class Daemon:
         tmp.write_bytes(blob)
         os.replace(tmp, self._session_path(cs))
         os.chmod(self._session_path(cs), 0o600)
+        # audit R2-04: 回滚防护 —— 把当前进度追加到 append-only epoch 日志。
+        # 日志与状态文件分离；攻击者把状态文件滚回旧版后，epoch 日志里
+        # 记录的更大进度仍在（普通文件替换无法回退 append-only 日志内容）。
+        progress = (_progress_of(cs.session))
+        with open(self._epoch_log_path(cs.peer_fp), "a") as f:
+            f.write(f"{int(time.time())} {progress}\n")
+        os.chmod(self._epoch_log_path(cs.peer_fp), 0o600)
 
     def load_session(self, cs: ContactSession) -> None:
         p = self._session_path(cs)
@@ -225,6 +243,26 @@ class Daemon:
             return
         rs = RatchetSession()
         rs.import_state(p.read_bytes())
+        # audit R2-04: 拒绝加载进度落后于 epoch 日志的状态（检测回滚）。
+        # 允许相等（正常重启）。epoch 日志缺失（旧版本升级）则跳过。
+        ep = self._epoch_log_path(cs.peer_fp)
+        if ep.exists():
+            last = 0
+            with open(ep) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        try:
+                            last = max(last, int(parts[1]))
+                        except ValueError:
+                            continue
+            progress = _progress_of(rs)
+            if progress < last:
+                raise RuntimeError(
+                    f"session state rollback detected for peer "
+                    f"{_b64e(cs.peer_fp)}: state progress {progress} < "
+                    f"epoch log {last} — refusing to load (possible "
+                    f"restore attack; delete BOTH files to reset)")
         cs.session = rs
 
     def log_message(self, direction: str, peer_fp: bytes, text: str) -> None:
