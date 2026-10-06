@@ -41,6 +41,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from .fskey import Identity
 
 MAGIC_RATCHET = b"NBXRATCH1"
+MAGIC_STATE = b"NBXRATCHST1"
 HEADER_SIZE = 40
 NONCE_SIZE = 12
 MAX_SKIP = 256
@@ -150,6 +151,70 @@ class RatchetSession:
             self._send_ck, self._recv_ck = None, ck0
         self._established = True
         return self
+
+    # ---------- 会话状态持久化（M2.5a：通讯录/会话简历的地基） ----------
+
+    def export_state(self) -> bytes:
+        """序列化会话状态（敏感！等同长期私钥，落盘须加密，如 anon包装）。
+
+        格式: MAGIC_STATE(12) || ver(1) || fields TLV:
+          1 root_key(32)  2 send_ck(32 或空)  3 recv_ck(32 或空)
+          4 dh_self_priv(32)  5 dh_remote_pub(32)  6 skipped entries
+          7 counters(prev_send_len, send_n, recv_n 各 4B LE)
+        skipped entry: ratchet_pub(32) || msg_no(4) || mk(32)
+        """
+        import base64 as _b64
+        if not self._established or self._dh_self is None:
+            raise RuntimeError("session not established")
+        def f(t: int, v: bytes) -> bytes:
+            return bytes([t]) + struct.pack("<I", len(v)) + v
+        out = MAGIC_STATE + bytes([1])   # magic 11B + ver
+        out += f(1, self._root_key)
+        out += f(2, self._send_ck or b"")
+        out += f(3, self._recv_ck or b"")
+        out += f(4, self._dh_self.private_bytes(
+            serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+            serialization.NoEncryption()))
+        out += f(5, self._dh_remote_pub)
+        sk_blob = b"".join(
+            pub + struct.pack("<I", no) + mk
+            for (pub, no), mk in self._skipped.items())
+        out += f(6, sk_blob)
+        counters = struct.pack("<III", self._prev_send_len, self._send_n, self._recv_n)
+        out += f(7, counters)
+        return _b64.b64encode(out)
+
+    @classmethod
+    def import_state(cls, blob: bytes) -> "RatchetSession":
+        """从 export_state 恢复会话。"""
+        import base64 as _b64
+        raw = _b64.b64decode(blob)
+        mlen = len(MAGIC_STATE)
+        if raw[:mlen] != MAGIC_STATE or raw[mlen] != 1:
+            raise ValueError("bad ratchet state blob")
+        s = cls()
+        off = mlen + 1
+        fields = {}
+        while off < len(raw):
+            t = raw[off]
+            ln = struct.unpack("<I", raw[off + 1:off + 5])[0]
+            fields[t] = raw[off + 5:off + 5 + ln]
+            off += 5 + ln
+        s._root_key = fields[1]
+        s._send_ck = fields[2] or None
+        s._recv_ck = fields[3] or None
+        s._dh_self = x25519.X25519PrivateKey.from_private_bytes(fields[4])
+        s._dh_self_pub = _raw_pub(s._dh_self)
+        s._dh_remote_pub = fields[5]
+        sk_blob = fields[6]
+        po = 0
+        while po < len(sk_blob):
+            pub, no = sk_blob[po:po + 32], struct.unpack("<I", sk_blob[po + 32:po + 36])[0]
+            s._skipped[(pub, no)] = sk_blob[po + 36:po + 68]
+            po += 68
+        s._prev_send_len, s._send_n, s._recv_n = struct.unpack("<III", fields[7])
+        s._established = True
+        return s
 
     # ---------- 收发 ----------
 
