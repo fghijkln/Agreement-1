@@ -159,6 +159,10 @@ export class RegistryDo {
           return json(429, { ok: false, error: "global queue budget exceeded" });
         await this.state.storage.put("total_bytes", total);
         await this.state.storage.put("rcp:" + fp, existing + envLen);
+        // audit R2-12: 活动时间戳每次投递刷新——decay 判据是"最后投递
+        // 距今超过 TTL"，不是"创建距今"。否则活跃收件人会被误清账，
+        // 造成账本与真实 DO 队列脱钩。
+        await this.state.storage.put("rcp_at:" + fp, Date.now());
         return json(200, { ok: true });
       }
       const count = (await this.state.storage.get<number>("recip_count")) ?? 0;
@@ -171,6 +175,10 @@ export class RegistryDo {
       await this.state.storage.put("total_bytes", total0);
       await this.state.storage.put("rcp:" + fp, envLen);
       await this.state.storage.put("rcp_at:" + fp, Date.now());
+      // audit R2-11: 保证 decay 循环被调度(alarm 不存在时设置)
+      if (!(await this.state.storage.getAlarm())) {
+        await this.state.storage.setAlarm(Date.now() + RECIPIENT_DECAY_CHECK_MS);
+      }
       return json(200, { ok: true, new: true });
     }
     // audit R2-08: /pop 后归还额度（信封离开队列，字节账相应减少）。
@@ -183,12 +191,27 @@ export class RegistryDo {
       const cur = await this.state.storage.get<number>("rcp:" + fp);
       if (cur !== undefined) {
         const total = Math.max(0, ((await this.state.storage.get<number>("total_bytes")) ?? 0) - freed);
+        const left = Math.max(0, cur - freed);
         await this.state.storage.put("total_bytes", total);
-        await this.state.storage.put("rcp:" + fp, Math.max(0, cur - freed));
+        if (left === 0) {
+          // audit R2-11: 收件人账目清零 = 不再占用名额, 释放 recip_count。
+          // 否则 count 只增不减, 50k 个一次性收件人即永久锁死新收件人。
+          await this.state.storage.delete("rcp:" + fp);
+          await this.state.storage.delete("rcp_at:" + fp);
+          const count = (await this.state.storage.get<number>("recip_count")) ?? 0;
+          await this.state.storage.put("recip_count", Math.max(0, count - 1));
+        } else {
+          await this.state.storage.put("rcp:" + fp, left);
+        }
       }
       return json(200, { ok: true });
     }
-    // audit R2-08: TTL 清账 —— 让不活跃收件人释放名额与字节账。
+    // audit R2-08/R2-11: TTL 清账 —— 由 DO alarm 定期自动调用(见 alarm()),
+    // 清理"最后投递距今超过 TTL"的收件人账目。R2-12: 判据是 rcp_at(每次
+    // 投递刷新)而非创建时间; 账目清零的条目已在 release 即时释放。
+    // 注意: 本端点只清 RegistryDo 的账; 收件人 DO 的真实队列由其自身
+    // TTL GC(StoredEnvelope.at)逐条过期——账本条目仅在"最后活动超 TTL"
+    // 时删除, 此时其对应 DO 内信封必然也已全部过期(TTL 相同), 账实一致。
     if (req.method === "POST" && path === "/decay") {
       const now = Date.now();
       let count = (await this.state.storage.get<number>("recip_count")) ?? 0;
@@ -211,6 +234,15 @@ export class RegistryDo {
         await this.state.storage.put("total_bytes", Math.max(0, total));
       }
       return json(200, { ok: true, decayed: dels.length });
+    }
+    // audit R2-11: 账本观测端点(运维/回归测试用)。返回当前资源账目。
+    if (req.method === "GET" && path === "/stats") {
+      return json(200, {
+        ok: true,
+        registered: (await this.state.storage.get<number>("count")) ?? 0,
+        recip_count: (await this.state.storage.get<number>("recip_count")) ?? 0,
+        total_bytes: (await this.state.storage.get<number>("total_bytes")) ?? 0,
+      });
     }
     // audit R2-01: 中继身份签名。body = client_fp(8) || ts(8)。
     // 私钥 seed 首次生成并持久化于本单例 DO；签名覆盖
@@ -247,9 +279,21 @@ export class RegistryDo {
     }
     return json(404, { ok: false, error: "not found" });
   }
+
+  // audit R2-11: alarm 自调度——每 24h 自动 /decay, 保证收件人名额
+  // 与字节预算可回收。首次 alarm 在首个收件人登记时设置。
+  async alarm(): Promise<void> {
+    const count = (await this.state.storage.get<number>("recip_count")) ?? 0;
+    if (count > 0) {
+      const req = new Request("https://do/decay", { method: "POST" });
+      await this.fetch(req);
+    }
+    await this.state.storage.setAlarm(Date.now() + RECIPIENT_DECAY_CHECK_MS);
+  }
 }
 
 const RELAY_AUTH_INFO = "nbx-relay-server-auth-v1";
+const RECIPIENT_DECAY_CHECK_MS = 86400 * 1000;   // alarm 周期: 每天扫一次
 
 /** 把 32B Ed25519 seed 包成 PKCS#8（WebCrypto importKey 需要容器格式）。 */
 function ed25519SeedToPkcs8(seed: Uint8Array): Uint8Array {
