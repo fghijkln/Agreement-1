@@ -160,7 +160,8 @@ class TransportStack:
     """
 
     def __init__(self, book: ContactBook, my_identity: Identity,
-                 socks_proxy: str | None = None):
+                 socks_proxy: str | None = None,
+                 pin_file: str | None = None):
         self.book = book
         self.me = my_identity
         self.my_fp = fp_of_pub(my_identity.export_public())
@@ -172,7 +173,22 @@ class TransportStack:
         #  - L3 中继: AUTH 登记成功（服务器返回其按公钥算出的 fp 且校验一致）
         #  - L1/L2: mini-relay 地址须在 challenge 应答验证通过后加入 verified
         self._verified_endpoints: set[str] = set()
-        self._relay_pins: dict[str, bytes] = {}   # audit R2-01: base -> pinned relay_pub
+        # audit R2-01 + R2-09: base -> pinned relay_pub。TOFU pin 必须跨
+        # 进程生命周期持久化——纯内存 pin 在重启后重新 TOFU，攻击者只要
+        # 控制重启后的首次连接即可替换 relay key。格式: 每行 b64(base) b64(relay_pub)。
+        self._relay_pins: dict[str, bytes] = {}
+        self._pin_file = pin_file
+        if pin_file and os.path.exists(pin_file):
+            try:
+                import base64 as _b64
+                with open(pin_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) == 2:
+                            self._relay_pins[_b64.b64decode(parts[0]).decode("utf-8")] = (
+                                _b64.b64decode(parts[1]))
+            except Exception:
+                pass                            # pin 文件损坏视为无 pin（保守重建）
 
     # ---- 各层实现 ----
 
@@ -279,15 +295,38 @@ class TransportStack:
                 relay_sig, b"nbx-relay-server-auth-v1" + self.my_fp + relay_pub + ts)
         except Exception:
             raise ConnectionError("relay auth: bad relay signature")
-        # TOFU pin: 首见即固定，此后变化视为 MITM
+        # TOFU pin: 首见即固定，此后变化视为 MITM。R2-09: 落盘持久化。
         prev = self._relay_pins.get(base)
         if prev is None:
             self._relay_pins[base] = relay_pub
+            self._save_pins()
         elif prev != relay_pub:
             raise ConnectionError(
                 f"relay identity changed (possible MITM) at {base}")
         self._relay_authed.add(base)
         self._verified_endpoints.add(base)   # R-16: 认证成功 ≠ 仅 HTTP 可达
+
+    def _save_pins(self) -> None:
+        """audit R2-09: TOFU pin 持久化到 pin 文件（原子替换写）。"""
+        if not self._pin_file:
+            return
+        import base64 as _b64
+        import tempfile
+        lines = "".join(
+            f"{_b64.b64encode(k.encode()).decode()} {_b64.b64encode(v).decode()}\n"
+            for k, v in sorted(self._relay_pins.items()))
+        d = os.path.dirname(self._pin_file) or "."
+        fd, tmp = tempfile.mkstemp(dir=d)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(lines)
+            os.replace(tmp, self._pin_file)
+            os.chmod(self._pin_file, 0o600)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def _send_via_anon(self, c: Contact, onion_addr: str, blob: bytes) -> TransportResult:
         if not self.socks_proxy:

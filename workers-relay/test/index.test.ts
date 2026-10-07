@@ -194,6 +194,36 @@ describe("nbx workers relay", () => {
     expect(r.status).toBe(403);
   });
 
+  it("R2-08: normal delivery still works with recipient admission", async () => {
+    const bob = await genKey();
+    const alice = await genKey();
+    const bobFp = await fpOf(bob);
+    const aliceFp = await fpOf(alice);
+    await SELF.fetch("https://example.com/auth", { method: "POST", body: await authBody(bob) as unknown as BodyInit });
+    await SELF.fetch("https://example.com/auth", { method: "POST", body: await authBody(alice) as unknown as BodyInit });
+    const env = packMessage(1, aliceFp, bobFp, new TextEncoder().encode("r2-08-ok"));
+    const r = await SELF.fetch("https://example.com/envelope", {
+      method: "POST",
+      body: concat(env, await deliveryProof(alice, env)) as unknown as BodyInit,
+    });
+    expect(r.status).toBe(202);
+  });
+
+  it("R2-08: fake recipients are budget-accounted", async () => {
+    const alice = await genKey();
+    const aliceFp = await fpOf(alice);
+    await SELF.fetch("https://example.com/auth", { method: "POST", body: await authBody(alice) as unknown as BodyInit });
+    for (let i = 0; i < 3; i++) {
+      const fakeRecv = new Uint8Array(8).fill(i + 10);
+      const env = packMessage(1, aliceFp, fakeRecv, new Uint8Array(8));
+      const r = await SELF.fetch("https://example.com/envelope", {
+        method: "POST",
+        body: concat(env, await deliveryProof(alice, env)) as unknown as BodyInit,
+      });
+      expect(r.status).toBe(202);
+    }
+  });
+
   it("auth: same key re-register is idempotent (R-03/R-10)", async () => {
     const k1 = await genKey();
     let r = await SELF.fetch("https://example.com/auth", {

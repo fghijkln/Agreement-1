@@ -123,6 +123,30 @@ class MemoryStore:
         return len(self._q.get(recv_fp, []))
 
 
+def load_or_create_relay_key(path: str):
+    """audit R2-10: 加载或创建 relay Ed25519 签名密钥并落盘。
+
+    与 Workers 端(RegistryDo 持久 seed)对齐: relay 身份跨重启不变，
+    客户端 TOFU pin 不会因正常重启而误报 MITM。
+    """
+    import base64
+    import os
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            raw = base64.b64decode(f.read().strip())
+        return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+    priv = ed25519.Ed25519PrivateKey.generate()
+    raw = priv.private_bytes(serialization.Encoding.Raw,
+                             serialization.PrivateFormat.Raw,
+                             serialization.NoEncryption())
+    with open(path, "wb") as f:
+        f.write(base64.b64encode(raw) + b"\n")
+    os.chmod(path, 0o600)
+    return priv
+
+
 class RelayLogic:
     """协议逻辑：校验入队信封、打包取信响应。与传输层（HTTP/WS）解耦。"""
 

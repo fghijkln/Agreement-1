@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 
 from . import crypto, format, transfer
@@ -97,6 +98,7 @@ def main(argv=None):
 
     rl = sub.add_parser("relay", help="启动中继服务器（密文搬运工）")
     rl.add_argument("--port", type=int, default=8765)
+    rl.add_argument("--state-dir", default=".", help="relay 签名密钥存放目录 (audit R2-10)")
 
     ch = sub.add_parser("chat", help="经中继的加密会话客户端")
     ch.add_argument("--relay", default="http://127.0.0.1:8765")
@@ -300,7 +302,12 @@ def main(argv=None):
 
     elif args.cmd == "relay":
         from .relay import RelayLogic, MemoryStore, RelayServer
-        logic = RelayLogic(MemoryStore())
+        # audit R2-10: relay 签名密钥持久化——默认随机生成的话，重启后
+        # relay_pub 变化，所有 TOFU-pin 过本中继的客户端全部报 MITM。
+        # key 存 relay.key（0600），后续重启复用同一身份。
+        from .relay import load_or_create_relay_key
+        key_path = os.path.join(args.state_dir, "relay.key") if hasattr(args, "state_dir") else "relay.key"
+        logic = RelayLogic(MemoryStore(), relay_ed_priv=load_or_create_relay_key(key_path))
         srv = RelayServer(logic, port=args.port)
         print(f"[nbx relay] listening on 127.0.0.1:{args.port} (Ctrl+C to stop)")
         try:

@@ -203,6 +203,21 @@ export default {
         const quotaResp = await senderStub.fetch("https://do/send_quota", { method: "POST" });
         if (!quotaResp.ok) return json(429, { ok: false, error: "sender quota exceeded" });
       }
+      // audit R2-08: 收件人维度准入 —— sender quota 限速不限规模，
+      // 伪造 recv_fp 可无限建 DO。入队前过 RegistryDo 的收件人/字节预算。
+      {
+        const admit = new Uint8Array(12);
+        admit.set(hdr.recvFp, 0);
+        new DataView(admit.buffer).setUint32(8, envLen, true);
+        const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
+        const admitResp = await regStub.fetch("https://do/recipient_admit", {
+          method: "POST", body: admit as BodyInit,
+        });
+        if (!admitResp.ok) {
+          const err = await admitResp.json() as { error?: string };
+          return json(429, { ok: false, error: err.error ?? "recipient admission denied" });
+        }
+      }
       // 入队存裸信封（不带投递签名后缀），收件方无需感知
       const id = env.NBX_FP.idFromName(b64urlEncode(hdr.recvFp));
       const stub = env.NBX_FP.get(id);
@@ -233,7 +248,20 @@ export default {
       const id = env.NBX_FP.idFromName(fpB64);
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pop");
-      return json(200, await resp.json());
+      const payload = await resp.json() as { ok: boolean; envelopes?: string[] };
+      // audit R2-08: pop 走信封后归还字节账（信封离开队列）。
+      if (payload.envelopes && payload.envelopes.length) {
+        let freed = 0;
+        for (const e of payload.envelopes) freed += Math.floor(e.length * 3 / 4);
+        const rel = new Uint8Array(12);
+        rel.set(fp, 0);
+        new DataView(rel.buffer).setUint32(8, freed, true);
+        const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
+        await regStub.fetch("https://do/recipient_release", {
+          method: "POST", body: rel as BodyInit,
+        });
+      }
+      return json(200, payload);
     }
 
     return json(404, { ok: false, error: "not found" });

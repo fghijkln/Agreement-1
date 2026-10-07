@@ -8,6 +8,12 @@ const MAX_PER_FP = 256;
 const MAX_REGISTERED = 10000;            // audit R-10: 全局登记公钥上限
 const SEND_QUOTA_WINDOW_MS = 3600 * 1000;// audit R-10: per-sender 投递配额窗口
 const SEND_QUOTA_MAX = 600;              // 每发送者每小时最多投递数
+// audit R2-08: 收件人维度资源预算 —— sender quota 限速不限规模，
+// 伪造 recv_fp 可以无限创建 DO/持久化存储，必须在 RegistryDo 做
+// 收件人准入。三个闸门:
+const MAX_ACTIVE_RECIPIENTS = 50000;     // 存活收件人 fp 数上限
+const MAX_TOTAL_QUEUED_BYTES = 512 * 1024 * 1024; // 全局队列字节预算 (512 MiB)
+const RECIPIENT_DECAY_MS = 7 * 86400 * 1000;      // 收件人记账 TTL(与信封 TTL 同步)
 const MAGIC_MSG = new Uint8Array([0x4e, 0x42, 0x58, 0x4d, 0x53, 0x47, 0x01, 0x00]);
 
 function b64urlEncode(buf: Uint8Array): string {
@@ -137,6 +143,74 @@ export class RegistryDo {
       await this.state.storage.put("fp:" + fp, 1);
       await this.state.storage.put("count", count + 1);
       return json(200, { ok: true, existing: false });
+    }
+    // audit R2-08: 收件人准入闸门。body = recv_fp(8) || env_len(4 LE)。
+    // 已知收件人放行（记字节账）；新收件人受 MAX_ACTIVE_RECIPIENTS 限制。
+    // 返回 {ok:true} 准入 / 429 拒绝。信封 TTL 过期由 /decay 清账。
+    if (req.method === "POST" && path === "/recipient_admit") {
+      const body = new Uint8Array(await req.arrayBuffer());
+      if (body.length !== 12) return json(400, { ok: false, error: "bad admit payload" });
+      const fp = new Uint8Array(body.slice(0, 8)).toString();
+      const envLen = new DataView(body.buffer, body.byteOffset + 8, 4).getUint32(0, true);
+      const existing = await this.state.storage.get<number>("rcp:" + fp);
+      if (existing !== undefined) {
+        const total = ((await this.state.storage.get<number>("total_bytes")) ?? 0) + envLen;
+        if (total > MAX_TOTAL_QUEUED_BYTES)
+          return json(429, { ok: false, error: "global queue budget exceeded" });
+        await this.state.storage.put("total_bytes", total);
+        await this.state.storage.put("rcp:" + fp, existing + envLen);
+        return json(200, { ok: true });
+      }
+      const count = (await this.state.storage.get<number>("recip_count")) ?? 0;
+      if (count >= MAX_ACTIVE_RECIPIENTS)
+        return json(429, { ok: false, error: "recipient budget exhausted" });
+      const total0 = ((await this.state.storage.get<number>("total_bytes")) ?? 0) + envLen;
+      if (total0 > MAX_TOTAL_QUEUED_BYTES)
+        return json(429, { ok: false, error: "global queue budget exceeded" });
+      await this.state.storage.put("recip_count", count + 1);
+      await this.state.storage.put("total_bytes", total0);
+      await this.state.storage.put("rcp:" + fp, envLen);
+      await this.state.storage.put("rcp_at:" + fp, Date.now());
+      return json(200, { ok: true, new: true });
+    }
+    // audit R2-08: /pop 后归还额度（信封离开队列，字节账相应减少）。
+    // body = recv_fp(8) || bytes_freed(4 LE)。
+    if (req.method === "POST" && path === "/recipient_release") {
+      const body = new Uint8Array(await req.arrayBuffer());
+      if (body.length !== 12) return json(400, { ok: false, error: "bad release payload" });
+      const fp = new Uint8Array(body.slice(0, 8)).toString();
+      const freed = new DataView(body.buffer, body.byteOffset + 8, 4).getUint32(0, true);
+      const cur = await this.state.storage.get<number>("rcp:" + fp);
+      if (cur !== undefined) {
+        const total = Math.max(0, ((await this.state.storage.get<number>("total_bytes")) ?? 0) - freed);
+        await this.state.storage.put("total_bytes", total);
+        await this.state.storage.put("rcp:" + fp, Math.max(0, cur - freed));
+      }
+      return json(200, { ok: true });
+    }
+    // audit R2-08: TTL 清账 —— 让不活跃收件人释放名额与字节账。
+    if (req.method === "POST" && path === "/decay") {
+      const now = Date.now();
+      let count = (await this.state.storage.get<number>("recip_count")) ?? 0;
+      let total = (await this.state.storage.get<number>("total_bytes")) ?? 0;
+      const dels: string[] = [];
+      const atMap = await this.state.storage.list({ prefix: "rcp_at:" });
+      atMap.forEach((v, k) => {
+        if (now - (v as number) > RECIPIENT_DECAY_MS) dels.push(k);
+      });
+      for (const k of dels) {
+        const fp = k.slice("rcp_at:".length);
+        const bytes = (await this.state.storage.get<number>("rcp:" + fp)) ?? 0;
+        total -= bytes;
+        count -= 1;
+        await this.state.storage.delete("rcp_at:" + fp);
+        await this.state.storage.delete("rcp:" + fp);
+      }
+      if (dels.length) {
+        await this.state.storage.put("recip_count", Math.max(0, count));
+        await this.state.storage.put("total_bytes", Math.max(0, total));
+      }
+      return json(200, { ok: true, decayed: dels.length });
     }
     // audit R2-01: 中继身份签名。body = client_fp(8) || ts(8)。
     // 私钥 seed 首次生成并持久化于本单例 DO；签名覆盖
