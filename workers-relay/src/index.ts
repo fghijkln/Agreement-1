@@ -218,13 +218,39 @@ export default {
           return json(429, { ok: false, error: err.error ?? "recipient admission denied" });
         }
       }
-      // 入队存裸信封（不带投递签名后缀），收件方无需感知
+      // 入队存裸信封（不带投递签名后缀），收件方无需感知。
+      // audit R2-13: admit 与 push 是两个成功点, 必须事务性对齐——
+      // push 失败要退掉 admit 刚记的账; push 的队列淘汰(eviction)
+      // 也要按被淘汰字节数退账, 否则 Registry 账本虚胀(phantom
+      // accounting), 可被反复投递满队列收件人吃空全局预算。
       const id = env.NBX_FP.idFromName(b64urlEncode(hdr.recvFp));
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/push", {
         method: "POST", body: body.slice(0, envLen) as BodyInit,
       });
-      return json(resp.status === 202 ? 202 : 400, await resp.json());
+      const pushPayload = await resp.json() as { ok?: boolean; evicted_bytes?: number };
+      const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
+      if (resp.status === 202 && pushPayload.ok) {
+        const evicted = pushPayload.evicted_bytes ?? 0;
+        if (evicted > 0) {
+          const rel = new Uint8Array(12);
+          rel.set(hdr.recvFp, 0);
+          new DataView(rel.buffer).setUint32(8, evicted, true);
+          await regStub.fetch("https://do/recipient_release", {
+            method: "POST", body: rel as BodyInit,
+          });
+        }
+      } else {
+        // push 失败: 退掉 admit 记入的账(补偿事务), 不留残留。
+        const rel = new Uint8Array(12);
+        rel.set(hdr.recvFp, 0);
+        new DataView(rel.buffer).setUint32(8, envLen, true);
+        await regStub.fetch("https://do/recipient_release", {
+          method: "POST", body: rel as BodyInit,
+        });
+        return json(400, { ok: false, error: "enqueue failed" });
+      }
+      return json(202, pushPayload);
     }
 
     if (req.method === "POST" && url.pathname.startsWith("/inbox/")) {
@@ -248,14 +274,18 @@ export default {
       const id = env.NBX_FP.idFromName(fpB64);
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pop");
-      const payload = await resp.json() as { ok: boolean; envelopes?: string[] };
+      const payload = await resp.json() as { ok: boolean; envelopes?: string[]; popped_bytes?: number };
       // audit R2-08: pop 走信封后归还字节账（信封离开队列）。
-      if (payload.envelopes && payload.envelopes.length) {
+      // audit R2-13: 退账口径改为 DO 端精确统计的原始字节数(popped_bytes),
+      // 与 admit/eviction 记账口径一致; b64 长度近似有 ±2B/条误差, 长期
+      // 累积同样造成账实漂移。
+      if (payload.popped_bytes === undefined && payload.envelopes && payload.envelopes.length) {
         let freed = 0;
         for (const e of payload.envelopes) freed += Math.floor(e.length * 3 / 4);
+        payload.popped_bytes = freed;
         const rel = new Uint8Array(12);
         rel.set(fp, 0);
-        new DataView(rel.buffer).setUint32(8, freed, true);
+        new DataView(rel.buffer).setUint32(8, payload.popped_bytes ?? 0, true);
         const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
         await regStub.fetch("https://do/recipient_release", {
           method: "POST", body: rel as BodyInit,

@@ -102,18 +102,31 @@ export class NbxFpDurableObject {
       for (let i = 0; i < 8; i++) if (blob[i] !== MAGIC_MSG[i]) return json(400, { ok: false, error: "bad envelope" });
       const q = (await this.state.storage.get<StoredEnvelope[]>("q")) ?? [];
       q.push({ at: Date.now(), env: b64urlEncode(blob) });
-      // 满则丢最旧
-      const trimmed = q.length > MAX_PER_FP ? q.slice(q.length - MAX_PER_FP) : q;
+      // 满则丢最旧。audit R2-13: 被淘汰信封的字节数必须返回给 worker,
+      // 由 worker 调 RegistryDo /recipient_release 退账——否则 Registry
+      // 账本只记"进"不记"淘汰", 反复投递满队列收件人可把 512MiB 预算
+      // 吃空(phantom accounting), 而真实 DO 恒为 MAX_PER_FP 条。
+      const evicted = q.length > MAX_PER_FP ? q.slice(0, q.length - MAX_PER_FP) : [];
+      const trimmed = evicted.length ? q.slice(evicted.length) : q;
       await this.state.storage.put("q", trimmed);
+      let evictedBytes = 0;
+      for (const e of evicted) {
+        // 账本记的是信封真实字节数(与 admit 的 envLen 同口径);
+        // DO 内存的是 b64url 文本, 换算回原始字节 = floor(len*3/4)。
+        evictedBytes += Math.floor(e.env.length * 3 / 4);
+      }
       const msgId = b64urlEncode(blob.slice(28, 44));
-      return json(202, { ok: true, msg_id: msgId });
+      return json(202, { ok: true, msg_id: msgId, evicted_bytes: evictedBytes });
     }
 
     if (req.method === "GET" && path === "/pop") {
       await this.gc();
       const q = (await this.state.storage.get<StoredEnvelope[]>("q")) ?? [];
       await this.state.storage.put("q", []);       // 取走即清
-      return json(200, { ok: true, envelopes: q.map((e) => e.env) });
+      // audit R2-13: 返回精确原始字节数供 worker 退账(与 admit 口径一致)。
+      let popped = 0;
+      for (const e of q) popped += Math.floor(e.env.length * 3 / 4);
+      return json(200, { ok: true, envelopes: q.map((e) => e.env), popped_bytes: popped });
     }
 
     return json(404, { ok: false, error: "not found" });
