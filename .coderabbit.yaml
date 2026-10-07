@@ -1,0 +1,68 @@
+# CodeRabbit 审查配置 — nebula-protocol (NBX)
+# 项目性质: 端到端加密传输协议 + Cloudflare Workers 中继 + Python daemon/GUI
+# 审查基调: 密码学边界 > 资源预算 > 测试真实性 > 风格
+
+language: zh-CN
+early_access: false
+
+reviews:
+  profile: chill            # 抑制风格类噪音, 聚焦实质问题
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  path_filters:
+    - "!dist/**"
+    - "!app/build/**"
+    - "!app/dist/**"
+    - "!**/*.deb"
+    - "!**/__pycache__/**"
+    - "!.venv/**"
+  path_instructions:
+    - path: "nbx/*.py"
+      instructions: |
+        NBX 加密协议核心 (ratchet/信封/FS/PQ/中继客户端)。审查重点:
+        - 密码学边界: nonce 重复/密钥重用、AEAD 关联数据(AAD)覆盖是否完整、
+          域分隔常量是否唯一、随机源是否 secrets/安全 DRBG
+        - 时序侧信道: 比较认证标签/指纹是否用常数时间比较
+        - 错误处理: 认证失败路径绝不能吞异常后继续(不得 except: pass 后放行)
+        - assert 不得用于安全不变量(-O 会剥离), 必须显式 raise
+        - 资源: 队列/缓存/预算的记账是否先检查后记账(防失败污染状态)
+    - path: "nbx/vendor/**"
+      instructions: |
+        Vendored 第三方参考实现 (kyber_py ML-KEM)。不修改上游代码——
+        只报实质性安全问题(如真正的密钥泄露路径), 忽略风格/文档/测试覆盖。
+    - path: "workers-relay/src/*.ts"
+      instructions: |
+        Cloudflare Workers 中继。审查重点:
+        - 资源耗尽: 任何新建 DO/写 storage 的路径必须有准入闸门
+          (sender quota / recipient admission / 全局字节预算), 先检查后记账
+        - 认证边界: 每个 endpoint 的签名验证覆盖范围(域分隔+完整负载)、
+          时间窗检查、重放防护; TOFU pin 语义不可被绕过
+        - DO idFromName 的键是否可被攻击者无成本制造大量实例
+        - WebCrypto API 用法错误(私钥导出、签名/验签密钥混用)
+    - path: "workers-relay/test/**"
+      instructions: |
+        vitest 测试。断言必须验证真实行为——空的/恒真的 expect 视为 bug。
+    - path: "tests/**"
+      instructions: |
+        pytest 回归测试。历史教训(必须执行):
+        - 死断言(if False else True / 恒真断言)是真实 bug, 直接 flag
+        - fixture 必须用 pytest 内置名(tmp_path 不是 tmp)
+        - 测试不得因网络/外部服务不可达而静默通过
+        - 声称覆盖的安全行为必须有可失败的断言
+    - path: "tools/**"
+      instructions: |
+        构建/运维脚本。关注 subprocess 注入、路径遍历、敏感文件权限。
+    - path: "*.md"
+      instructions: |
+        协议文档与安全声明: 声称的安全属性必须与代码一致;
+        已知边界(如 epoch 防护不覆盖整目录回滚)必须如实披露, 不得夸大。
+
+chat:
+  auto_reply: true
