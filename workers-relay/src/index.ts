@@ -274,29 +274,45 @@ export default {
       const id = env.NBX_FP.idFromName(fpB64);
       const stub = env.NBX_FP.get(id);
       const resp = await stub.fetch("https://do/pop");
-      const payload = await resp.json() as { ok: boolean; envelopes?: string[]; popped_bytes?: number };
+      const payload = await resp.json() as { ok: boolean; envelopes?: string[]; popped_bytes?: number; release_id?: string | null };
       // audit R2-08: pop 走信封后归还字节账（信封离开队列）。
-      // audit R2-13: 退账口径 = DO 端精确统计的原始字节数(popped_bytes),
-      // 与 admit/eviction 记账口径一致。
-      // audit R2-14: 计算 popped_bytes(fallback, 仅兼容旧 DO 格式)与
-      // 释放账本是两件独立的事, 必须拆开——此前 release 被错误地包进
-      // "popped_bytes === undefined" 分支, 而新 DO 恒返回 popped_bytes,
-      // 生产 /inbox 取信路径永远不退账(total_bytes/recip_count 永久
-      // 泄漏)。现在: 无论 popped_bytes 来自 DO 还是 fallback, 只要
-      // >0 就必须 release。
+      // audit R2-13: 退账口径 = DO 端精确统计的原始字节数(popped_bytes)。
+      // audit R2-14: 计算 fallback 与释放账本拆开。
+      // audit R2-15: pop 与 release 是跨 DO 操作, 无事务。两阶段取信:
+      //   /pop(prepare, pending 保留) → release(幂等, release_id 去重)
+      //   → /pop_ack(commit, 真正删除)。release 失败: 信封仍在 pending,
+      // 返回 503 让客户端重试整个 /inbox——重试时 /pop 重发同批、
+      // release 去重集保证不重复退账, 消息不丢、账本不泄漏。
       if (payload.popped_bytes === undefined && payload.envelopes) {
         let freed = 0;
         for (const e of payload.envelopes) freed += Math.floor(e.length * 3 / 4);
         payload.popped_bytes = freed;
       }
       if ((payload.popped_bytes ?? 0) > 0) {
-        const rel = new Uint8Array(12);
+        const rel = new Uint8Array(28);
         rel.set(fp, 0);
         new DataView(rel.buffer).setUint32(8, payload.popped_bytes!, true);
-        const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
-        await regStub.fetch("https://do/recipient_release", {
-          method: "POST", body: rel as BodyInit,
-        });
+        if (payload.release_id) {
+          // 16B release_id(from UUID) 做幂等键
+          const rid = payload.release_id.replace(/-/g, "");
+          for (let i = 0; i < 16; i++) rel[12 + i] = parseInt(rid.slice(i * 2, i * 2 + 2), 16);
+        }
+        let released = false;
+        for (let attempt = 0; attempt < 3 && !released; attempt++) {
+          try {
+            const rr = await env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"))
+              .fetch("https://do/recipient_release", { method: "POST", body: rel as BodyInit });
+            released = rr.ok;
+          } catch { /* 重试 */ }
+        }
+        if (!released) return json(503, { ok: false, error: "release unavailable, retry" });
+        // 退账成功 → 提交删除 pending(幂等)
+        if (payload.release_id) {
+          const ackBytes = new Uint8Array(16).map((_, i) => rel[12 + i]);
+          await stub.fetch("https://do/pop_ack", {
+            method: "POST", body: ackBytes as unknown as BodyInit,
+          });
+        }
       }
       return json(200, payload);
     }

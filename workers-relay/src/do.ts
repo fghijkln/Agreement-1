@@ -53,6 +53,11 @@ export class NbxFpDurableObject {
     const q = ((await this.state.storage.get<StoredEnvelope[]>("q")) ?? [])
       .filter((e) => Date.now() - e.at < TTL_MS);
     await this.state.storage.put("q", q);
+    // audit R2-15: pending 批次超 TTL 即弃(其信封已过期, Registry decay
+    // 会同步清账); ack 前的 pending 由下次 /pop 重发, 客户端可能重复收
+    // 到同一批——上层协议本就有会话去重(InvalidTag 防线), 重投无害。
+    const p = await this.state.storage.get<PendingBatch>("pending");
+    if (p && Date.now() - p.at > TTL_MS) await this.state.storage.delete("pending");
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -119,18 +124,58 @@ export class NbxFpDurableObject {
       return json(202, { ok: true, msg_id: msgId, evicted_bytes: evictedBytes });
     }
 
+    // audit R2-15: /pop 改为两阶段取信的第一阶段(prepare)。
+    // 此前这里直接 q=[] 再由 worker 异步退账——两个 DO 无事务, release
+    // 失败即"消息已删+账未退"(消息丢失 + phantom accounting)。
+    // 现在: 整批移入 pending(带 release_id), /inbox 退账成功后调
+    // /pop_ack 提交删除; 退账失败可安全重试(release 幂等), pending
+    // 内信封保留, 下次 /pop 重发同批——不丢消息、不泄漏账本。
+    // pending 也有 TTL(gc 同 TTL_MS), 客户端彻底放弃时账目由 decay 兜底。
     if (req.method === "GET" && path === "/pop") {
       await this.gc();
+      // audit R2-15: 若存在未确认的 pending 批次, 重发同批(客户端上次
+      // 可能因 release 失败未收到 200)——保证"消息不丢"。release_id
+      // 不变, worker 侧退账幂等, 不会重复扣账。
+      const pend = await this.state.storage.get<PendingBatch>("pending");
+      if (pend) {
+        let pb = 0;
+        for (const e of pend.q) pb += Math.floor(e.env.length * 3 / 4);
+        return json(200, { ok: true, envelopes: pend.q.map((e) => e.env),
+                           popped_bytes: pb, release_id: pend.release_id });
+      }
       const q = (await this.state.storage.get<StoredEnvelope[]>("q")) ?? [];
-      await this.state.storage.put("q", []);       // 取走即清
-      // audit R2-13: 返回精确原始字节数供 worker 退账(与 admit 口径一致)。
+      if (!q.length) return json(200, { ok: true, envelopes: [], popped_bytes: 0, release_id: null });
+      const releaseId = crypto.randomUUID();
       let popped = 0;
       for (const e of q) popped += Math.floor(e.env.length * 3 / 4);
-      return json(200, { ok: true, envelopes: q.map((e) => e.env), popped_bytes: popped });
+      await this.state.storage.put("pending", { release_id: releaseId, at: Date.now(), q });
+      await this.state.storage.put("q", []);
+      return json(200, { ok: true, envelopes: q.map((e) => e.env),
+                         popped_bytes: popped, release_id: releaseId });
+    }
+    // audit R2-15: 第二阶段(commit)。退账成功后由 worker 调用, 真正删除。
+    // body = release_id 的 16B 原始字节(UUID 去 '-' 后 hex 解码)。
+    // 幂等: 无 pending 或 release_id 不匹配时 no-op(重复 ack 无害)。
+    if (req.method === "POST" && path === "/pop_ack") {
+      const raw = new Uint8Array(await req.arrayBuffer());
+      if (raw.length !== 16) return json(400, { ok: false, error: "bad ack payload" });
+      const hex = [...raw].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const expect = hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16)
+                   + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
+      const p = await this.state.storage.get<PendingBatch>("pending");
+      if (p && p.release_id === expect) await this.state.storage.delete("pending");
+      return json(200, { ok: true });
     }
 
     return json(404, { ok: false, error: "not found" });
   }
+}
+
+/** audit R2-15: 两阶段取信的 pending 批次(尚未确认提交)。 */
+interface PendingBatch {
+  release_id: string;
+  at: number;
+  q: StoredEnvelope[];
 }
 
 /**
@@ -195,12 +240,21 @@ export class RegistryDo {
       return json(200, { ok: true, new: true });
     }
     // audit R2-08: /pop 后归还额度（信封离开队列，字节账相应减少）。
-    // body = recv_fp(8) || bytes_freed(4 LE)。
+    // audit R2-15: release 幂等化。body = recv_fp(8) || bytes_freed(4 LE) || release_id(16)。
+    // 同一 release_id 重复调用只退一次账(去重集, 与条目同步清理)——
+    // pop/release 之间的跨 DO 失败可安全重试, 不会重复退账导致账本变负。
     if (req.method === "POST" && path === "/recipient_release") {
       const body = new Uint8Array(await req.arrayBuffer());
-      if (body.length !== 12) return json(400, { ok: false, error: "bad release payload" });
+      if (body.length !== 12 && body.length !== 28)
+        return json(400, { ok: false, error: "bad release payload" });
       const fp = new Uint8Array(body.slice(0, 8)).toString();
       const freed = new DataView(body.buffer, body.byteOffset + 8, 4).getUint32(0, true);
+      if (body.length === 28) {
+        const rid = b64urlEncode(new Uint8Array(body.slice(12, 28)));
+        const dupKey = "rel:" + fp + ":" + rid;
+        if (await this.state.storage.get<number>(dupKey)) return json(200, { ok: true, dup: true });
+        await this.state.storage.put(dupKey, 1);   // 清理见 /decay
+      }
       const cur = await this.state.storage.get<number>("rcp:" + fp);
       if (cur !== undefined) {
         const total = Math.max(0, ((await this.state.storage.get<number>("total_bytes")) ?? 0) - freed);
@@ -241,6 +295,9 @@ export class RegistryDo {
         count -= 1;
         await this.state.storage.delete("rcp_at:" + fp);
         await this.state.storage.delete("rcp:" + fp);
+        // audit R2-15: 同步清理该 fp 的 release 幂等去重键
+        const dups = await this.state.storage.list({ prefix: "rel:" + fp + ":" });
+        for (const dk of dups.keys()) await this.state.storage.delete(dk);
       }
       if (dels.length) {
         await this.state.storage.put("recip_count", Math.max(0, count));
