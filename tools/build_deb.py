@@ -59,7 +59,7 @@ for name, body in launchers.items():
     os.chmod(p, 0o755)
 
 # 3. systemd 单元
-open(f"{pkg}/lib/systemd/system/nbx-daemon.service", "w").write(textwrap.dedent('''\
+open(f"{pkg}/lib/systemd/system/nbx-daemon@.service", "w").write(textwrap.dedent('''\
     [Unit]
     Description=NBX Messenger Daemon (E2E encrypted IM engine)
     After=network-online.target
@@ -86,7 +86,7 @@ readme = f"""NBX Messenger (deb) — 端到端加密即时通讯
   /usr/bin/nbx          CLI (seal/unseal/relay/identity/...)
   /usr/bin/nbx-relayd   中继服务器 (默认 :8765)
   /usr/bin/nbx-daemon   常驻会话引擎 (IPC: ~/.local/state/nbx/daemon.sock 或 /var/lib/nbx)
-  /lib/systemd/system/nbx-daemon.service
+  /lib/systemd/system/nbx-daemon@.service
 
 用法:
   sudo systemctl enable --now nbx-daemon@$USER
