@@ -17,6 +17,6 @@ jobs:
           python-version: '3.11'
       - name: Install deps
         run: |
-          pip install -e . pytest
+          pip install pytest cryptography
       - name: Run pytest
-        run: python -m pytest -q
+        run: PYTHONPATH=. python -m pytest -q

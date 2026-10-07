@@ -21,11 +21,12 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install bandit
-        run: pip install bandit sarif-tools
+        run: pip install bandit bandit-sarif-formatter
       - name: Run bandit (SARIF)
         run: |
           bandit -r nbx app tools -f sarif -o bandit.sarif || true
       - name: Upload SARIF
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: bandit.sarif
