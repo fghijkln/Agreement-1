@@ -18,7 +18,7 @@ import struct
 import threading
 import time
 import urllib.error
-import urllib.request
+import urllib.request, urllib.parse
 
 from . import message as msg
 from . import replay
@@ -43,6 +43,10 @@ def _urlopen_retry(req, timeout: float = 10, attempts: int = 5):
     (重复投递同一信封在中继侧无害, 收件人 ratchet 侧由重放防护兜底)。
     """
     delay = 1.0
+    # audit B310: 中继 URL 只允许 https(或本机调试 http), 禁 file:/ftp: 等自定义 scheme
+    scheme = urllib.parse.urlparse(req.full_url).scheme.lower()
+    if scheme not in ("https", "http"):
+        raise ValueError(f"refusing non-HTTP(S) relay URL scheme: {scheme}")
     for i in range(attempts):
         try:
             return urllib.request.urlopen(req, timeout=timeout)

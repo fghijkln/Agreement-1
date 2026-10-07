@@ -321,7 +321,9 @@ class TransportStack:
         s = socket.create_connection((phost, int(pport)), timeout=10)
         # SOCKS5 握手: 05 01 00 → 05 00; CONNECT domain
         s.sendall(b"\x05\x01\x00")
-        assert s.recv(2) == b"\x05\x00"
+        if s.recv(2) != b"\x05\x00":
+            s.close()
+            raise OSError("SOCKS5 handshake rejected")   # audit: assert 会被 -O 剥离
         s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
                   + struct.pack(">H", port))
         resp = s.recv(10)

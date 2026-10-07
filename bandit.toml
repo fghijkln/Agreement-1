@@ -1,0 +1,26 @@
+# Bandit 豁免清单(文档)。
+# 生效位置: .github/workflows/bandit.yml 里的 --skip / --exclude 参数。
+# 规则: 每个豁免必须带理由; 每次安全审计复审本文件; 新增豁免 = 新增审计义务。
+
+# B101 assert_used —— 安全路径的 assert 已全部改为显式 raise(见
+#   ratchet.py/contacts.py 的 "audit: assert 会被 -O 剥离" 注释);
+#   剩余 assert 为非安全内部检查。
+# B103 chmod 0o755 —— tools/build_deb.py: deb 打包目录需要执行位, 打包语义。
+# B104 bind 0.0.0.0 —— nbx/transfer.py、tools/natpunch.py 是网络端点
+#   程序, 对外监听为功能需求。
+# B108 /tmp 固定路径 —— tools/build_deb.py 构建脚本, 本机一次性目录。
+# B110 try/except/pass —— viewer.py 图片头 best-effort 探测、app UI
+#   轮询, 失败即降级显示, 无安全语义。
+# B112 try/except/continue —— contacts.py 多 endpoint 轮询, 单点失败
+#   跳过即语义。
+# B310 urlopen scheme —— 已真修: chat.py _urlopen_retry 增加
+#   https/http scheme 白名单, 非 HTTP(S) 直接 raise。豁免仅为消除
+#   已修复项的重复告警。
+# B404/B603/B607 subprocess —— tools/build_deb.py 固定命令 dpkg-deb +
+#   固定参数, 无用户输入。
+
+# exclude_dirs = nbx/vendor —— 第三方纯 Python ML-KEM(kyber_py) 参考
+#   实现, 原样 vendored 不改上游。其中 AES-ECB 告警是 CTR-DRBG 的
+#   NIST SP 800-90A 标准构造(分组原语用于计数器模式, 非 ECB 加密数
+#   据), B311/B101 同为上游设计。CodeQL 对该目录的
+#   py/weak-cryptographic-algorithm ×2 同理判为误报。

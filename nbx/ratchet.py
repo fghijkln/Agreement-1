@@ -329,7 +329,8 @@ class RatchetSession:
 
     def _recv_step(self, remote_pub: bytes, prev_len: int):
         """收到对方新 ratchet 公钥：接收链 DH step。"""
-        assert self._dh_self is not None, "session not established"
+        if self._dh_self is None:
+            raise RuntimeError("session not established")   # audit: assert 会被 -O 剥离
         if self._recv_ck is not None and self._dh_remote_pub:
             self._skip_to(self._dh_remote_pub, prev_len)
         shared = _dh(self._dh_self, remote_pub)
@@ -339,7 +340,8 @@ class RatchetSession:
 
     def _send_step(self):
         """发送侧 DH step：生成本方新 ratchet 密钥并派生新发送链。"""
-        assert self._dh_remote_pub, "no remote ratchet key"
+        if not self._dh_remote_pub:
+            raise RuntimeError("no remote ratchet key")     # audit: assert 会被 -O 剥离
         self._prev_send_len = self._send_n
         self._dh_self = x25519.X25519PrivateKey.generate()
         self._dh_self_pub = _raw_pub(self._dh_self)
@@ -375,7 +377,8 @@ class RatchetSession:
         if self._send_ck is None:
             # 后发言方首次发送：只做发送侧 DH step（其接收链 CK0 不动）
             self._send_step()
-        assert self._send_ck is not None
+        if self._send_ck is None:
+            raise RuntimeError("send chain missing after ratchet step")
         self._send_ck, mk = _kdf_ck(self._send_ck)
         nonce = secrets.token_bytes(NONCE_SIZE)
         hdr = pack_header(self._dh_self_pub, self._prev_send_len, self._send_n)
