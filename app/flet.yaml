@@ -16,4 +16,4 @@ android:
 
 dependencies:
   - cryptography
-  - nbx  # 本仓库以 path 依赖打入 (见 build 命令 --include-packages)
+  - nbx  # 打包副本 app/nbx/ 由 tools/build_apk.py 同步生成 (不入库)

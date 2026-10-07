@@ -7,3 +7,4 @@ dist/
 build/
 app/build/
 app/dist/
+app/nbx/
