@@ -276,16 +276,23 @@ export default {
       const resp = await stub.fetch("https://do/pop");
       const payload = await resp.json() as { ok: boolean; envelopes?: string[]; popped_bytes?: number };
       // audit R2-08: pop 走信封后归还字节账（信封离开队列）。
-      // audit R2-13: 退账口径改为 DO 端精确统计的原始字节数(popped_bytes),
-      // 与 admit/eviction 记账口径一致; b64 长度近似有 ±2B/条误差, 长期
-      // 累积同样造成账实漂移。
-      if (payload.popped_bytes === undefined && payload.envelopes && payload.envelopes.length) {
+      // audit R2-13: 退账口径 = DO 端精确统计的原始字节数(popped_bytes),
+      // 与 admit/eviction 记账口径一致。
+      // audit R2-14: 计算 popped_bytes(fallback, 仅兼容旧 DO 格式)与
+      // 释放账本是两件独立的事, 必须拆开——此前 release 被错误地包进
+      // "popped_bytes === undefined" 分支, 而新 DO 恒返回 popped_bytes,
+      // 生产 /inbox 取信路径永远不退账(total_bytes/recip_count 永久
+      // 泄漏)。现在: 无论 popped_bytes 来自 DO 还是 fallback, 只要
+      // >0 就必须 release。
+      if (payload.popped_bytes === undefined && payload.envelopes) {
         let freed = 0;
         for (const e of payload.envelopes) freed += Math.floor(e.length * 3 / 4);
         payload.popped_bytes = freed;
+      }
+      if ((payload.popped_bytes ?? 0) > 0) {
         const rel = new Uint8Array(12);
         rel.set(fp, 0);
-        new DataView(rel.buffer).setUint32(8, payload.popped_bytes ?? 0, true);
+        new DataView(rel.buffer).setUint32(8, payload.popped_bytes!, true);
         const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
         await regStub.fetch("https://do/recipient_release", {
           method: "POST", body: rel as BodyInit,
