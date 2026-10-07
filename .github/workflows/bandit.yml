@@ -1,0 +1,31 @@
+# Bandit: Python SAST(第三方)。CodeQL 之外的补充视角, 宽松级别先建基线。
+name: Bandit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '51 4 * * 1'
+
+jobs:
+  bandit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install bandit
+        run: pip install bandit sarif-tools
+      - name: Run bandit (SARIF)
+        run: |
+          bandit -r nbx app tools -f sarif -o bandit.sarif || true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif

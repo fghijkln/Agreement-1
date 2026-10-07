@@ -1,0 +1,22 @@
+# pytest 全量回归: 每次 push/PR 跑测试, 守住"宣称通过前必须真跑"的纪律
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          pip install -e . pytest
+      - name: Run pytest
+        run: python -m pytest -q
