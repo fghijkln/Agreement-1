@@ -74,8 +74,8 @@ class MessengerApp:
                 ft.Row([ft.Text("我的指纹:"), self.me_fp]),
                 ft.Divider(height=4),
                 self.pub_input,
-                ft.Row([ft.ElevatedButton("添加联系人", on_click=self.on_add),
-                        ft.ElevatedButton("粘贴", on_click=self.on_paste)]),
+                ft.Row([ft.FilledButton("添加联系人", on_click=self.on_add),
+                        ft.FilledButton("粘贴", on_click=self.on_paste)]),
                 self.status,
                 ft.Divider(height=4),
                 self.chat_list,
@@ -91,16 +91,34 @@ class MessengerApp:
         self.me_fp.value = st["fp"]
 
     def on_paste(self, e):
-        if self.page:
-            data = self.page.clipboard
-            # flet 1.0: page.clipboard.get_text 需 await；桌面可用 pyperclip 替代
+        """flet 1.0: 剪贴板是 async service (page.services.get(Clipboard).get())。
+        事件回调跑在 flet 的 asyncio 事件循环线程里, 用 run_coroutine_threadsafe
+        不可行(不在同一线程), 改为: 若在循环线程则 create_task, 否则 asyncio.run。
+        简化: 统一走 asyncio.run —— 回调本身是同步函数, 在事件循环线程里嵌套
+        asyncio.run 会报错, 因此用后台线程兜底。"""
+        import asyncio
+        async def _get():
+            from flet import Clipboard
+            clip = next((x for x in self.page.services
+                         if isinstance(x, Clipboard)), None)
+            if clip is None:
+                clip = Clipboard()
+                self.page.services.append(clip)
+            return await clip.get()
+        def _done():
             try:
-                import pyperclip
-                self.pub_input.value = pyperclip.paste()
-                self.page.update()
+                val = asyncio.run(_get())
             except Exception:
+                val = None
+            if val:
+                self.pub_input.value = val
+            else:
                 self.status.value = "剪贴板不可用，请手动粘贴"
+            if self.page:
                 self.page.update()
+        if self.page:
+            import threading
+            threading.Thread(target=_done, daemon=True).start()
 
     def on_add(self, e):
         pub = (self.pub_input.value or "").strip()
