@@ -164,7 +164,9 @@ class MessengerApp:
 
 def main():
     app = MessengerApp()
-    ft.app(app.main)
+    # flet 1.0+: ft.app 已改名 ft.run
+    run = getattr(ft, "run", None) or getattr(ft, "app")
+    run(app.main)
 
 
 if __name__ == "__main__":
