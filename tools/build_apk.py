@@ -30,7 +30,8 @@ def main():
     cmd = [os.path.join(REPO, ".venv", "bin", "flet"), "build", "apk",
            "--org", "com.nebula", "--project", "nbxmessenger",
            "--product", "NBX Messenger",
-           "--description", "NBX 端到端加密即时通讯"]
+           "--description", "NBX 端到端加密即时通讯",
+           "--arch", "arm64-v8a"]
     if os.path.isdir(os.path.join(REPO, "nbx")):
         nbx_dst = os.path.join(APP, "nbx")
         src_files = []
