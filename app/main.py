@@ -60,6 +60,8 @@ class MessengerApp:
         page.theme_mode = ft.ThemeMode.DARK
 
         self.me_fp = ft.Text(selectable=True, size=12, opacity=0.7)
+        self.me_pub = ft.Text(selectable=True, size=10, opacity=0.7,
+                              max_lines=3)
         self.pub_input = ft.TextField(label="对方公钥 (base64)", multiline=True,
                                       min_lines=2, max_lines=3, expand=True)
         self.chat_list = ft.ListView(expand=True, spacing=8, auto_scroll=True)
@@ -71,7 +73,10 @@ class MessengerApp:
             ft.Column([
                 ft.Row([ft.Text("NBX", size=22, weight=ft.FontWeight.BOLD),
                         ft.Icon(ft.Icons.LOCK, color=ft.Colors.GREEN)],),
-                ft.Row([ft.Text("我的指纹:"), self.me_fp]),
+                ft.Row([ft.Text("我的指纹:"), self.me_fp,
+                        ft.FilledButton("复制我的公钥",
+                                        on_click=self.on_copy_pub)]),
+                self.me_pub,
                 ft.Divider(height=4),
                 self.pub_input,
                 ft.Row([ft.FilledButton("添加联系人", on_click=self.on_add),
@@ -89,6 +94,29 @@ class MessengerApp:
     def refresh_me(self):
         st = self.ipc({"cmd": "status"})
         self.me_fp.value = st["fp"]
+        self.me_pub.value = self.daemon.export_public()
+
+    def on_copy_pub(self, e):
+        """复制本机公钥到剪贴板 (flet 1.0 async Clipboard service)。"""
+        import asyncio, threading
+        pub = self.daemon.export_public()
+        async def _set():
+            from flet import Clipboard
+            clip = next((x for x in self.page.services
+                         if isinstance(x, Clipboard)), None)
+            if clip is None:
+                clip = Clipboard()
+                self.page.services.append(clip)
+            await clip.set(pub)
+        def _run():
+            try:
+                asyncio.run(_set())
+                self.status.value = "公钥已复制，发给对方即可添加你"
+            except Exception:
+                self.status.value = "复制失败，请长按公钥文本手动复制"
+            if self.page:
+                self.page.update()
+        threading.Thread(target=_run, daemon=True).start()
 
     def on_paste(self, e):
         """flet 1.0: 剪贴板是 async service (page.services.get(Clipboard).get())。
