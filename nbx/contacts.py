@@ -1,23 +1,4 @@
-"""NBX 通讯录 + 三层传输栈（nbx/contacts.py, nbx/transport.py 合并）。
-
-M2.5a 地基：
-- Contact：一个联系人 = 身份公钥材料 + 最近 ratchet 会话状态 + 候选地址表
-- 三层传输，按优先级降级：
-    L1 P2P 直连（候选地址，UDP 打洞 — 本模块只做地址簿管理与直连 TCP 局域网，UDP 打洞在 M2.5c）
-    L2 匿名网络（Tor SOCKS5 连 .onion / I2P — 候选地址为 onion:port）
-    L3 中继服务器（HTTP relay）
-- 传输结果统一为 (layer, bytes)，供上层记录"哪层成功"
-
-联系人文件格式（JSON，敏感——含 ratchet 状态，等同长期私钥）：
-  { "<fp_b32>": {
-      "pub": "<b64 身份公钥材料>",
-      "session": "<b64 ratchet 状态>",
-      "addrs": [{"layer": 1|2|3, "addr": "...", "ts": <unix>}],
-      "pref": [1, 2, 3]   # 降级顺序
-  } }
-"""
 from __future__ import annotations
-
 import base64
 import hashlib
 import json
@@ -27,86 +8,68 @@ import struct
 import time
 import urllib.request
 import urllib.error
-
 from . import message as msg
 from .fskey import Identity
 from .ratchet import RatchetSession
-
 LAYER_P2P = 1
 LAYER_ANON = 2
 LAYER_RELAY = 3
-
-LAYER_NAMES = {LAYER_P2P: "p2p", LAYER_ANON: "anon", LAYER_RELAY: "relay"}
-
+LAYER_NAMES = {LAYER_P2P: 'p2p', LAYER_ANON: 'anon', LAYER_RELAY: 'relay'}
 
 def fp_of_pub(pub_b64: str) -> bytes:
-    """路由指纹 = SHA-256(原始公钥材料 x||ed)[:8]。
-
-    audit R-03 配套统一：与 chat.fingerprint8 / fskey.fingerprint /
-    服务器端 fp 计算同源（历史版本哈希 b64 字符串，与身份显示指纹不一致）。
-    """
-    pub_raw = base64.b64decode(pub_b64 + "=" * (-len(pub_b64) % 4))
+    pub_raw = base64.b64decode(pub_b64 + '=' * (-len(pub_b64) % 4))
     return hashlib.sha256(pub_raw).digest()[:8]
 
-
 def fp_b32(fp: bytes) -> str:
-    return base64.b32encode(fp).decode().rstrip("=")
-
+    return base64.b32encode(fp).decode().rstrip('=')
 
 def _b64e(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
-
 def _b64d(s: str) -> bytes:
-    """服务器响应使用 urlsafe-b64（无 padding）；本地兼容两种变体。"""
-    pad = "=" * (-len(s) % 4)
+    pad = '=' * (-len(s) % 4)
     try:
         return base64.urlsafe_b64decode(s + pad)
     except Exception:
         return base64.b64decode(s + pad)
 
-
 class Contact:
-    def __init__(self, pub_b64: str, session_state: bytes | None = None,
-                 addrs: list[dict] | None = None, pref: list[int] | None = None):
+
+    def __init__(self, pub_b64: str, session_state: bytes | None=None, addrs: list[dict] | None=None, pref: list[int] | None=None):
         self.pub_b64 = pub_b64
         self.fp = fp_of_pub(pub_b64)
-        self.session_state = session_state      # export_state() 的 b64
-        self.addrs = addrs or []                # [{"layer", "addr", "ts"}]
+        self.session_state = session_state
+        self.addrs = addrs or []
         self.pref = pref or [LAYER_P2P, LAYER_ANON, LAYER_RELAY]
 
     def last_session_layer(self) -> int | None:
-        used = [a["layer"] for a in self.addrs if a.get("last_ok")]
+        used = [a['layer'] for a in self.addrs if a.get('last_ok')]
         return used[-1] if used else None
 
-
 class ContactBook:
-    """通讯录持久化。文件敏感：建议放 anon() 包装或加密目录。"""
 
     def __init__(self, path: str):
         self.path = path
         self._c: dict[str, Contact] = {}
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
             for k, v in raw.items():
-                self._c[k] = Contact(v["pub"], v.get("session"),
-                                     v.get("addrs"), v.get("pref"))
+                self._c[k] = Contact(v['pub'], v.get('session'), v.get('addrs'), v.get('pref'))
 
     def save(self):
+
         def enc(v):
             if isinstance(v, bytes):
                 return _b64e(v)
             return v
-        data = {fp_b32(c.fp): {"pub": c.pub_b64, "session": enc(c.session_state),
-                               "addrs": c.addrs, "pref": c.pref}
-                for c in self._c.values()}
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        data = {fp_b32(c.fp): {'pub': c.pub_b64, 'session': enc(c.session_state), 'addrs': c.addrs, 'pref': c.pref} for c in self._c.values()}
+        tmp = self.path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=1)
         os.replace(tmp, self.path)
 
-    def add(self, pub_b64: str, pref: list[int] | None = None) -> Contact:
+    def add(self, pub_b64: str, pref: list[int] | None=None) -> Contact:
         c = Contact(pub_b64, pref=pref)
         self._c[fp_b32(c.fp)] = c
         return c
@@ -120,13 +83,11 @@ class ContactBook:
     def all(self) -> list[Contact]:
         return list(self._c.values())
 
-    # ---------- 会话简历 ----------
-
     def store_session(self, fp: bytes, session: RatchetSession):
         c = self.get(fp)
         if c is None:
-            raise KeyError(f"unknown contact fp {fp.hex()}")
-        c.session_state = session.export_state().decode("ascii")
+            raise KeyError(f'unknown contact fp {fp.hex()}')
+        c.session_state = session.export_state().decode('ascii')
 
     def load_session(self, fp: bytes) -> RatchetSession | None:
         c = self.get(fp)
@@ -137,191 +98,146 @@ class ContactBook:
         except (ValueError, KeyError):
             return None
 
-
-# ---------- 传输层 ----------
-
 class TransportResult:
-    def __init__(self, layer: int, ok: bool, detail: str = ""):
+
+    def __init__(self, layer: int, ok: bool, detail: str=''):
         self.layer = layer
         self.ok = ok
         self.detail = detail
 
-
 class TransportStack:
-    """三层传输栈：按联系人 pref 顺序尝试，成功即记录该层可用。
 
-    L3 中继：现有 relay HTTP 协议（auth 一次，之后直接 post/poll）。
-    L2 匿名：SOCKS5 代理（Tor 默认 127.0.0.1:9050）连 onion:port 上的
-             同款 relay 协议——onion 服务后面跑什么（自建 relay / 对端
-             的收信服务）对栈透明。
-    L1 P2P：候选地址 TCP 直连（局域网/已打通的公网映射），协议同 L3
-            （对端跑 mini-relay）。UDP 打洞在 M2.5c 加入，届时 L1 地址
-            表扩充 udp:// 类型。
-    """
-
-    def __init__(self, book: ContactBook, my_identity: Identity,
-                 socks_proxy: str | None = None,
-                 pin_file: str | None = None):
+    def __init__(self, book: ContactBook, my_identity: Identity, socks_proxy: str | None=None, pin_file: str | None=None):
         self.book = book
         self.me = my_identity
         self.my_fp = fp_of_pub(my_identity.export_public())
-        self.socks_proxy = socks_proxy      # "127.0.0.1:9050"
+        self.socks_proxy = socks_proxy
         self._relay_authed: set[bytes] = set()
-        # audit R-14/15/16: reachable ≠ authenticated。
-        # last_ok 只说明"HTTP 可达"（恶意 endpoint 返 202 也能刷出来），
-        # 绝不作为发送取信凭据的依据。proof 只发给通过认证的 endpoint：
-        #  - L3 中继: AUTH 登记成功（服务器返回其按公钥算出的 fp 且校验一致）
-        #  - L1/L2: mini-relay 地址须在 challenge 应答验证通过后加入 verified
         self._verified_endpoints: set[str] = set()
-        # audit R2-01 + R2-09: base -> pinned relay_pub。TOFU pin 必须跨
-        # 进程生命周期持久化——纯内存 pin 在重启后重新 TOFU，攻击者只要
-        # 控制重启后的首次连接即可替换 relay key。格式: 每行 b64(base) b64(relay_pub)。
         self._relay_pins: dict[str, bytes] = {}
         self._pin_file = pin_file
         if pin_file and os.path.exists(pin_file):
             try:
                 import base64 as _b64
-                with open(pin_file, "r", encoding="utf-8") as f:
+                with open(pin_file, 'r', encoding='utf-8') as f:
                     for line in f:
                         parts = line.split()
                         if len(parts) == 2:
-                            self._relay_pins[_b64.b64decode(parts[0]).decode("utf-8")] = (
-                                _b64.b64decode(parts[1]))
+                            self._relay_pins[_b64.b64decode(parts[0]).decode('utf-8')] = _b64.b64decode(parts[1])
             except Exception:
-                pass                            # pin 文件损坏视为无 pin（保守重建）
+                pass
 
-    # ---- 各层实现 ----
-
-    def _http_post(self, url: str, data: bytes, proxy: str | None,
-                   timeout: float = 8.0) -> tuple[int, bytes]:
+    def _http_post(self, url: str, data: bytes, proxy: str | None, timeout: float=8.0) -> tuple[int, bytes]:
         if proxy:
             s = self._socks_connect(*self._split_addr(url))
-            http = (f"POST {url} HTTP/1.0\r\nContent-Length: {len(data)}\r\n\r\n").encode() + data
+            http = f'POST {url} HTTP/1.0\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data
             s.sendall(http)
-            resp = b""
+            resp = b''
             while True:
                 chunk = s.recv(65536)
                 if not chunk:
                     break
                 resp += chunk
             s.close()
-            status = int(resp.split(b" ")[1]) if resp else 0
-            return status, resp.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in resp else b""
+            status = int(resp.split(b' ')[1]) if resp else 0
+            return (status, resp.split(b'\r\n\r\n', 1)[1] if b'\r\n\r\n' in resp else b'')
         handler = urllib.request.ProxyHandler({})
         opener = urllib.request.build_opener(handler)
-        req = urllib.request.Request(url, data=data, method="POST")
+        req = urllib.request.Request(url, data=data, method='POST')
         try:
             with opener.open(req, timeout=timeout) as r:
-                return r.status, r.read()
+                return (r.status, r.read())
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            return (e.code, e.read())
 
-    def _http_get(self, url: str, proxy: str | None,
-                  timeout: float = 8.0) -> tuple[int, bytes]:
+    def _http_get(self, url: str, proxy: str | None, timeout: float=8.0) -> tuple[int, bytes]:
         handler = urllib.request.ProxyHandler({})
         opener = urllib.request.build_opener(handler)
         try:
             with opener.open(url, timeout=timeout) as r:
-                return r.status, r.read()
+                return (r.status, r.read())
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            return (e.code, e.read())
 
     def _socks_opener(self, proxy: str):
-        """SOCKS5 opener（需要 PySocks；Tor 场景）。"""
-        import socks  # noqa
-        host, port = proxy.rsplit(":", 1)
+        import socks
+        host, port = proxy.rsplit(':', 1)
         socks.set_default_proxy(socks.SOCKS5, host, int(port))
         socket.socket = socks.socksocket
         return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def _send_via_relay(self, c: Contact, addr: str, blob: bytes) -> TransportResult:
         try:
-            base = addr.rstrip("/")
+            base = addr.rstrip('/')
             if base not in self._relay_authed:
                 self._relay_auth(base)
-            status, _ = self._http_post(base + "/envelope",
-                                        blob + self._delivery_proof(blob), None)
-            return TransportResult(LAYER_RELAY, status == 202, f"HTTP {status}")
+            status, _ = self._http_post(base + '/envelope', blob + self._delivery_proof(blob), None)
+            return TransportResult(LAYER_RELAY, status == 202, f'HTTP {status}')
         except Exception as e:
             return TransportResult(LAYER_RELAY, False, str(e))
 
     def _delivery_proof(self, blob: bytes) -> bytes:
-        """信封投递签名（audit R-06 / R2-02）：签名绑定完整信封（含密文）。"""
         import hashlib, struct as _s
-        ts = _s.pack("<Q", int(time.time()))
+        ts = _s.pack('<Q', int(time.time()))
         digest = hashlib.sha256(blob).digest()
-        return ts + self.me.ed_priv.sign(b"nbx-relay-delivery-v2" + digest + ts)
+        return ts + self.me.ed_priv.sign(b'nbx-relay-delivery-v2' + digest + ts)
 
     def _relay_auth(self, base: str):
-        """TOFU 登记本方公钥（audit R-03：发送 64B 公钥材料，fp 由服务器算）。"""
         import struct as _s
-        ts = _s.pack("<Q", int(time.time()))
+        ts = _s.pack('<Q', int(time.time()))
         from cryptography.hazmat.primitives import serialization
-        x_pub = self.me.x_priv.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        ed_pub = self.me.ed_priv.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        x_pub = self.me.x_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        ed_pub = self.me.ed_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         pub_material = x_pub + ed_pub
-        sig = self.me.ed_priv.sign(b"nbx-relay-auth-v1" + pub_material + ts)
-        status, resp = self._http_post(base + "/auth", pub_material + ts + sig, None)
+        sig = self.me.ed_priv.sign(b'nbx-relay-auth-v1' + pub_material + ts)
+        status, resp = self._http_post(base + '/auth', pub_material + ts + sig, None)
         if status != 200:
-            raise ConnectionError(f"relay auth failed: HTTP {status}")
-        # audit R2-01: 严格校验。此前 `if srv_fp and srv_fp != my_fp` 在
-        # 服务器不回 fp 时静默放行（空 fp = 认证"成功"）；且 fp 是自报的，
-        # 恶意 endpoint 可回 {"fp": <我的fp>} 骗取 verified 身份并拿到 proof。
-        # 现在：空 fp 拒绝 + 中继身份签名验证（TOFU pin relay_pub）。
+            raise ConnectionError(f'relay auth failed: HTTP {status}')
         try:
             srv = json.loads(resp)
         except Exception:
-            raise ConnectionError("relay auth: bad response")
-        if not isinstance(srv, dict) or not srv.get("ok"):
-            raise ConnectionError(f"relay auth failed: {srv}")
-        srv_fp = _b64d(srv.get("fp", ""))
+            raise ConnectionError('relay auth: bad response')
+        if not isinstance(srv, dict) or not srv.get('ok'):
+            raise ConnectionError(f'relay auth failed: {srv}')
+        srv_fp = _b64d(srv.get('fp', ''))
         if not srv_fp:
-            raise ConnectionError("relay auth: server did not return fp")
+            raise ConnectionError('relay auth: server did not return fp')
         if srv_fp != self.my_fp:
-            raise ConnectionError(
-                f"relay fp mismatch: local={self.my_fp.hex()} relay={srv_fp.hex()}")
-        relay_pub_b64, relay_sig_b64 = srv.get("relay_pub", ""), srv.get("relay_sig", "")
+            raise ConnectionError(f'relay fp mismatch: local={self.my_fp.hex()} relay={srv_fp.hex()}')
+        relay_pub_b64, relay_sig_b64 = (srv.get('relay_pub', ''), srv.get('relay_sig', ''))
         if not relay_pub_b64 or not relay_sig_b64:
-            raise ConnectionError("relay auth: missing relay identity proof")
+            raise ConnectionError('relay auth: missing relay identity proof')
         relay_pub = _b64d(relay_pub_b64)
         relay_sig = _b64d(relay_sig_b64)
         if len(relay_pub) != 32 or len(relay_sig) != 64:
-            raise ConnectionError("relay auth: malformed relay identity proof")
+            raise ConnectionError('relay auth: malformed relay identity proof')
         from cryptography.hazmat.primitives.asymmetric import ed25519
         try:
-            ed25519.Ed25519PublicKey.from_public_bytes(relay_pub).verify(
-                relay_sig, b"nbx-relay-server-auth-v1" + self.my_fp + relay_pub + ts)
+            ed25519.Ed25519PublicKey.from_public_bytes(relay_pub).verify(relay_sig, b'nbx-relay-server-auth-v1' + self.my_fp + relay_pub + ts)
         except Exception:
-            raise ConnectionError("relay auth: bad relay signature")
-        # TOFU pin: 首见即固定，此后变化视为 MITM。R2-09: 落盘持久化。
+            raise ConnectionError('relay auth: bad relay signature')
         prev = self._relay_pins.get(base)
         if prev is None:
             self._relay_pins[base] = relay_pub
             self._save_pins()
         elif prev != relay_pub:
-            raise ConnectionError(
-                f"relay identity changed (possible MITM) at {base}")
+            raise ConnectionError(f'relay identity changed (possible MITM) at {base}')
         self._relay_authed.add(base)
-        self._verified_endpoints.add(base)   # R-16: 认证成功 ≠ 仅 HTTP 可达
+        self._verified_endpoints.add(base)
 
     def _save_pins(self) -> None:
-        """audit R2-09: TOFU pin 持久化到 pin 文件（原子替换写）。"""
         if not self._pin_file:
             return
         import base64 as _b64
         import tempfile
-        lines = "".join(
-            f"{_b64.b64encode(k.encode()).decode()} {_b64.b64encode(v).decode()}\n"
-            for k, v in sorted(self._relay_pins.items()))
-        d = os.path.dirname(self._pin_file) or "."
+        lines = ''.join((f'{_b64.b64encode(k.encode()).decode()} {_b64.b64encode(v).decode()}\n' for k, v in sorted(self._relay_pins.items())))
+        d = os.path.dirname(self._pin_file) or '.'
         fd, tmp = tempfile.mkstemp(dir=d)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(lines)
             os.replace(tmp, self._pin_file)
-            os.chmod(self._pin_file, 0o600)
+            os.chmod(self._pin_file, 384)
         except Exception:
             try:
                 os.unlink(tmp)
@@ -330,16 +246,14 @@ class TransportStack:
 
     def _send_via_anon(self, c: Contact, onion_addr: str, blob: bytes) -> TransportResult:
         if not self.socks_proxy:
-            return TransportResult(LAYER_ANON, False, "no socks proxy configured")
+            return TransportResult(LAYER_ANON, False, 'no socks proxy configured')
         try:
-            host, port = onion_addr.replace("http://", "").rsplit(":", 1)
-            # Tor 的 DNS/连接走 SOCKS5；用原始 socket 发 HTTP/1.0 请求
+            host, port = onion_addr.replace('http://', '').rsplit(':', 1)
             s = self._socks_connect(host, int(port))
             data = blob + self._delivery_proof(blob)
-            http = (f"POST /envelope HTTP/1.0\r\nHost: {onion_addr}\r\n"
-                    f"Content-Length: {len(data)}\r\n\r\n").encode() + data
+            http = f'POST /envelope HTTP/1.0\r\nHost: {onion_addr}\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data
             s.sendall(http)
-            resp = b""
+            resp = b''
             while True:
                 chunk = s.recv(65536)
                 if not chunk:
@@ -348,124 +262,104 @@ class TransportStack:
                 if len(resp) > 65536:
                     break
             s.close()
-            ok = b" 202 " in resp.split(b"\r\n")[0] if resp else False
-            return TransportResult(LAYER_ANON, ok, resp.split(b"\r\n")[0].decode(errors="replace"))
+            ok = b' 202 ' in resp.split(b'\r\n')[0] if resp else False
+            return TransportResult(LAYER_ANON, ok, resp.split(b'\r\n')[0].decode(errors='replace'))
         except Exception as e:
             return TransportResult(LAYER_ANON, False, str(e))
 
     def _socks_connect(self, host: str, port: int) -> socket.socket:
         if not self.socks_proxy:
-            raise RuntimeError("no socks proxy")
-        phost, pport = self.socks_proxy.rsplit(":", 1)
+            raise RuntimeError('no socks proxy')
+        phost, pport = self.socks_proxy.rsplit(':', 1)
         s = socket.create_connection((phost, int(pport)), timeout=10)
-        # SOCKS5 握手: 05 01 00 → 05 00; CONNECT domain
-        s.sendall(b"\x05\x01\x00")
-        if s.recv(2) != b"\x05\x00":
+        s.sendall(b'\x05\x01\x00')
+        if s.recv(2) != b'\x05\x00':
             s.close()
-            raise OSError("SOCKS5 handshake rejected")   # audit: assert 会被 -O 剥离
-        s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
-                  + struct.pack(">H", port))
+            raise OSError('SOCKS5 handshake rejected')
+        s.sendall(b'\x05\x01\x00\x03' + bytes([len(host)]) + host.encode() + struct.pack('>H', port))
         resp = s.recv(10)
         if resp[1] != 0:
             s.close()
-            raise ConnectionError(f"SOCKS5 connect failed: {resp[1]}")
+            raise ConnectionError(f'SOCKS5 connect failed: {resp[1]}')
         return s
 
     def _send_via_p2p(self, c: Contact, addr: str, blob: bytes) -> TransportResult:
-        """TCP 直连对端 mini-relay（host:port）。"""
         try:
-            host, port = addr.rsplit(":", 1)
+            host, port = addr.rsplit(':', 1)
             data = blob + self._delivery_proof(blob)
             with socket.create_connection((host, int(port)), timeout=5) as s:
-                http = (f"POST /envelope HTTP/1.0\r\nHost: {host}\r\n"
-                        f"Content-Length: {len(data)}\r\n\r\n").encode() + data
+                http = f'POST /envelope HTTP/1.0\r\nHost: {host}\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data
                 s.sendall(http)
                 resp = s.recv(4096)
-            ok = b" 202 " in resp.split(b"\r\n")[0] if resp else False
-            return TransportResult(LAYER_P2P, ok, resp.split(b"\r\n")[0].decode(errors="replace"))
+            ok = b' 202 ' in resp.split(b'\r\n')[0] if resp else False
+            return TransportResult(LAYER_P2P, ok, resp.split(b'\r\n')[0].decode(errors='replace'))
         except Exception as e:
             return TransportResult(LAYER_P2P, False, str(e))
 
-    # ---- 对外统一接口 ----
-
     def send(self, peer_fp: bytes, blob: bytes) -> TransportResult:
-        """按联系人 pref 顺序尝试投递；成功即记录层并返回。"""
         c = self.book.get(peer_fp)
         if c is None:
-            raise KeyError(f"unknown contact {peer_fp.hex()}")
-        senders = {LAYER_P2P: self._send_via_p2p,
-                   LAYER_ANON: self._send_via_anon,
-                   LAYER_RELAY: self._send_via_relay}
+            raise KeyError(f'unknown contact {peer_fp.hex()}')
+        senders = {LAYER_P2P: self._send_via_p2p, LAYER_ANON: self._send_via_anon, LAYER_RELAY: self._send_via_relay}
         for layer in c.pref:
-            for a in [a for a in c.addrs if a["layer"] == layer]:
-                r = senders[layer](c, a["addr"], blob)
+            for a in [a for a in c.addrs if a['layer'] == layer]:
+                r = senders[layer](c, a['addr'], blob)
                 if r.ok:
-                    a["last_ok"] = time.time()
+                    a['last_ok'] = time.time()
                     return r
-        return TransportResult(-1, False, "all layers failed")
+        return TransportResult(-1, False, 'all layers failed')
 
-    def poll(self, peer_hint: bytes | None = None) -> list[tuple[int, bytes]]:
-        """从所有可达层取信（L3 中继取自己桶；L1/L2 的对端 mini-relay 同理）。
-
-        audit R-04：proof 走 POST body，不进 URL。
-        返回 [(layer, envelope_bytes), ...]。
-        """
+    def poll(self, peer_hint: bytes | None=None) -> list[tuple[int, bytes]]:
         results: list[tuple[int, bytes]] = []
         proof = self._relay_proof()
         for c in self.book.all():
             for a in c.addrs:
-                if a["layer"] == LAYER_RELAY:
-                    base = a["addr"].rstrip("/")
-                    # audit R-14：proof 是 bearer 凭据，只发给已认证的 endpoint。
-                    # 未认证的地址先做 AUTH（服务器算 fp 校验一致）再发 proof；
-                    # 认证失败则绝不把 proof 交出去。
+                if a['layer'] == LAYER_RELAY:
+                    base = a['addr'].rstrip('/')
                     if base not in self._verified_endpoints:
                         try:
                             self._relay_auth(base)
                         except Exception:
                             continue
                     try:
-                        status, body = self._http_post(
-                            base + f"/inbox/{_b64e(self.my_fp)}", proof, None)
+                        status, body = self._http_post(base + f'/inbox/{_b64e(self.my_fp)}', proof, None)
                         if status == 200:
-                            for e in json.loads(body).get("envelopes", []):
+                            for e in json.loads(body).get('envelopes', []):
                                 results.append((LAYER_RELAY, _b64d(e)))
                     except Exception:
                         continue
-                # L1/L2 取信: 对端 mini-relay 同款 /inbox 接口
-                elif a.get("last_ok") and a["addr"] in self._verified_endpoints:
+                elif a.get('last_ok') and a['addr'] in self._verified_endpoints:
                     try:
-                        if a["layer"] == LAYER_ANON:
-                            s = self._socks_connect(*self._split_addr(a["addr"]))
+                        if a['layer'] == LAYER_ANON:
+                            s = self._socks_connect(*self._split_addr(a['addr']))
                         else:
-                            host, port = self._split_addr(a["addr"])
+                            host, port = self._split_addr(a['addr'])
                             s = socket.create_connection((host, port), timeout=5)
                         body = proof
-                        http = (f"POST /inbox/{_b64e(self.my_fp)} HTTP/1.0\r\nHost: {a['addr']}\r\n"
-                                f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+                        http = f"POST /inbox/{_b64e(self.my_fp)} HTTP/1.0\r\nHost: {a['addr']}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
                         s.sendall(http)
-                        resp = b""
+                        resp = b''
                         while True:
                             chunk = s.recv(65536)
                             if not chunk:
                                 break
                             resp += chunk
                         s.close()
-                        if b"\r\n\r\n" in resp:
-                            body = resp.split(b"\r\n\r\n", 1)[1]
-                            for e in json.loads(body).get("envelopes", []):
-                                results.append((a["layer"], _b64d(e)))
+                        if b'\r\n\r\n' in resp:
+                            body = resp.split(b'\r\n\r\n', 1)[1]
+                            for e in json.loads(body).get('envelopes', []):
+                                results.append((a['layer'], _b64d(e)))
                     except Exception:
                         continue
         return results
 
     @staticmethod
     def _split_addr(addr: str) -> tuple[str, int]:
-        a = addr.replace("http://", "")
-        host, port = a.rsplit(":", 1)
-        return host, int(port)
+        a = addr.replace('http://', '')
+        host, port = a.rsplit(':', 1)
+        return (host, int(port))
 
     def _relay_proof(self) -> bytes:
         import struct as _s
-        ts = _s.pack("<Q", int(time.time()))
-        return ts + self.me.ed_priv.sign(b"nbx-relay-auth-v1" + self.my_fp + ts)
+        ts = _s.pack('<Q', int(time.time()))
+        return ts + self.me.ed_priv.sign(b'nbx-relay-auth-v1' + self.my_fp + ts)

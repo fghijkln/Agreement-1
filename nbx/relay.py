@@ -1,78 +1,47 @@
-"""NBX 中继服务器 v0（nbx/relay.py）— 密文搬运工。
-
-设计原则（M2）：
-- 服务器只见明文路由头（nbx/message.py 的 48 字节头），永远见不到正文。
-  它做的三件事：收信（按接收方指纹分桶入队）、取信（拉取自己的桶）、
-  删除（取走即删——不支持服务器端历史，离线消息靠存储期内取走）。
-- 无账号体系：身份 = 公钥指纹。取信授权 = 证明持有对应私钥（挑战-应答）。
-- 无状态友好：全部状态 = 一个信封队列，可放内存 / SQLite / Workers KV。
-  存储层抽象成 RelayStore，内存实现开箱即用，Workers 部署换一个 Store 即可。
-
-信封 TTL：入队时打时间戳，默认 7 天过期，拉取时顺带清理。
-队列上限：每个指纹最多 MAX_PER_FP 条，满了丢最旧的（防滥用）。
-
-取信授权（简化版挑战-应答，v0）：
-  客户端 POST /inbox/<fp>，body = fp(8) || ts(8) || sig(64)，
-  sig = Ed25519_sign("nbx-relay-auth-v1" + fp + ts)（audit R-04：
-  proof 不走 URL query，避免进入反代/边缘访问日志可被重放）。
-  服务器用 AUTH 登记的公钥验证。AUTH 登记 pub_material(64)，
-  指纹由服务器计算（audit R-03：客户端不得自报地址）。
-
-HTTP API（任意 ASGI/WSGI 可包，核心逻辑在 RelayStore + RelayLogic）：
-  POST /envelope            body = 消息信封（明文头+加密体）→ 202 或 4xx
-  GET  /inbox/<fp>          取走该指纹全部信封 → 200 JSON / 404
-  GET  /health              存活探测
-"""
 from __future__ import annotations
-
 import base64
 import hashlib
 import json
 import struct
 import time
 from typing import Protocol
-
 from .message import parse_message, HEADER_SIZE
-
-DEFAULT_TTL = 7 * 86400          # 信封保存 7 天
-DEFAULT_MAX_PER_FP = 256         # 每个指纹队列上限
-MAX_ENVELOPE = 1 << 20           # 单信封 1 MiB（大文件走 FILE_OFFER + 外部 blob）
-DEFAULT_MAX_TOTAL_BYTES = 256 * (1 << 20)   # audit R-07：全局在存字节预算 256 MiB
-
-AUTH_INFO = b"nbx-relay-auth-v1"
-DELIVERY_INFO = b"nbx-relay-delivery-v2"
-RELAY_AUTH_INFO = b"nbx-relay-server-auth-v1"   # audit R2-01: 中继身份签名域
-
+DEFAULT_TTL = 7 * 86400
+DEFAULT_MAX_PER_FP = 256
+MAX_ENVELOPE = 1 << 20
+DEFAULT_MAX_TOTAL_BYTES = 256 * (1 << 20)
+AUTH_INFO = b'nbx-relay-auth-v1'
+DELIVERY_INFO = b'nbx-relay-delivery-v2'
+RELAY_AUTH_INFO = b'nbx-relay-server-auth-v1'
 
 def _b64e(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode().rstrip("=")
-
+    return base64.urlsafe_b64encode(b).decode().rstrip('=')
 
 def _b64d(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
-
+    return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
 
 class RelayStore(Protocol):
-    """存储抽象：内存版之外可换 SQLite / Workers KV / D1。"""
 
-    def put(self, recv_fp: bytes, envelope: bytes) -> bool: ...
-    def pop_all(self, recv_fp: bytes) -> list[bytes]: ...
-    def count(self, recv_fp: bytes) -> int: ...
+    def put(self, recv_fp: bytes, envelope: bytes) -> bool:
+        ...
 
+    def pop_all(self, recv_fp: bytes) -> list[bytes]:
+        ...
+
+    def count(self, recv_fp: bytes) -> int:
+        ...
 
 class MemoryStore:
-    """内存实现：{recv_fp: [(enqueued_at, envelope), ...]}。"""
 
-    def __init__(self, ttl: int = DEFAULT_TTL, max_per_fp: int = DEFAULT_MAX_PER_FP,
-                 max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES):
+    def __init__(self, ttl: int=DEFAULT_TTL, max_per_fp: int=DEFAULT_MAX_PER_FP, max_total_bytes: int=DEFAULT_MAX_TOTAL_BYTES):
         import threading
         self.ttl = ttl
         self.max_per_fp = max_per_fp
-        self.max_total_bytes = max_total_bytes   # audit R-07：全局字节预算
+        self.max_total_bytes = max_total_bytes
         self._q: dict[bytes, list[tuple[float, bytes]]] = {}
-        self._seen: dict[bytes, float] = {}     # msg_id -> 入队时间（幂等去重）
+        self._seen: dict[bytes, float] = {}
         self._total_bytes = 0
-        self._lock = threading.Lock()            # audit R-12：check+remember 原子化
+        self._lock = threading.Lock()
 
     def _gc(self, fp: bytes):
         now = time.time()
@@ -84,26 +53,18 @@ class MemoryStore:
         self._seen = {mid: t for mid, t in self._seen.items() if now - t < self.ttl}
 
     def put(self, recv_fp: bytes, envelope: bytes) -> bool:
-        """入队。返回 False 表示重复信封（同 msg_id），已忽略。
-
-        幂等去重：客户端在网络抖动下重发同一信封（POST 无响应重试）时，
-        中继侧只收一件——否则重复投递会让 ratchet 解密侧产生无谓的失败。
-        """
         mid = envelope[:8] + hashlib.blake2b(envelope, digest_size=16).digest()
         with self._lock:
-            # audit R-11/R-12：check → 预算检查 → 入队 → 记账 在临界区内
-            # 原子完成（并发 worker 不会双投），且失败路径不污染 replay 状态
-            # （先记账后失败的窗口已消除——合法消息不会被判重复而丢失）。
             self._gc(recv_fp)
             if mid in self._seen:
                 return False
             if self._total_bytes + len(envelope) > self.max_total_bytes:
-                raise ValueError("global envelope budget exceeded")
+                raise ValueError('global envelope budget exceeded')
             q = self._q.setdefault(recv_fp, [])
             q.append((time.time(), envelope))
             self._total_bytes += len(envelope)
             self._seen[mid] = time.time()
-            if len(q) > self.max_per_fp:        # 满了丢最旧
+            if len(q) > self.max_per_fp:
                 dropped = q[:-self.max_per_fp]
                 self._q[recv_fp] = q[-self.max_per_fp:]
                 for _, e in dropped:
@@ -122,266 +83,194 @@ class MemoryStore:
         self._gc(recv_fp)
         return len(self._q.get(recv_fp, []))
 
-
 def load_or_create_relay_key(path: str):
-    """audit R2-10: 加载或创建 relay Ed25519 签名密钥并落盘。
-
-    与 Workers 端(RegistryDo 持久 seed)对齐: relay 身份跨重启不变，
-    客户端 TOFU pin 不会因正常重启而误报 MITM。
-    """
     import base64
     import os
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ed25519
     if os.path.exists(path):
-        with open(path, "rb") as f:
+        with open(path, 'rb') as f:
             raw = base64.b64decode(f.read().strip())
         return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
     priv = ed25519.Ed25519PrivateKey.generate()
-    raw = priv.private_bytes(serialization.Encoding.Raw,
-                             serialization.PrivateFormat.Raw,
-                             serialization.NoEncryption())
-    with open(path, "wb") as f:
-        f.write(base64.b64encode(raw) + b"\n")
-    os.chmod(path, 0o600)
+    raw = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    with open(path, 'wb') as f:
+        f.write(base64.b64encode(raw) + b'\n')
+    os.chmod(path, 384)
     return priv
 
-
 class RelayLogic:
-    """协议逻辑：校验入队信封、打包取信响应。与传输层（HTTP/WS）解耦。"""
 
-    def __init__(self, store: RelayStore,
-                 ttl: int = DEFAULT_TTL,
-                 max_per_fp: int = DEFAULT_MAX_PER_FP,
-                 max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
-                 relay_ed_priv=None):
+    def __init__(self, store: RelayStore, ttl: int=DEFAULT_TTL, max_per_fp: int=DEFAULT_MAX_PER_FP, max_total_bytes: int=DEFAULT_MAX_TOTAL_BYTES, relay_ed_priv=None):
         self.store = store
         self.ttl = ttl
         self.max_per_fp = max_per_fp
-        self.max_total_bytes = max_total_bytes   # audit R-07：全局字节预算
-        self._pubkeys: dict[bytes, bytes] = {}   # fp -> ed25519 公钥（AUTH 登记）
-        # audit R2-01: 中继自身签名密钥。AUTH 响应附带对
-        # (client_fp, relay_pub, ts) 的签名，客户端 TOFU-pin relay_pub 后
-        # 可密码学认证"对面确实是这台中继"——此前仅回显 fp 属于自证。
+        self.max_total_bytes = max_total_bytes
+        self._pubkeys: dict[bytes, bytes] = {}
         if relay_ed_priv is None:
             from cryptography.hazmat.primitives.asymmetric import ed25519
             relay_ed_priv = ed25519.Ed25519PrivateKey.generate()
         self.relay_ed_priv = relay_ed_priv
         from cryptography.hazmat.primitives import serialization
-        self.relay_pub = relay_ed_priv.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        self.relay_pub = relay_ed_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
     def relay_attestation(self, client_fp: bytes, ts: bytes) -> bytes:
-        """audit R2-01: 中继对 (RELAY_AUTH_INFO||client_fp||relay_pub||ts) 签名。"""
         return self.relay_ed_priv.sign(RELAY_AUTH_INFO + client_fp + self.relay_pub + ts)
 
-    # ---------- 投递 ----------
-
-    def verify_sender(self, blob: bytes, envelope_len: int,
-                      now_skew: int = 300) -> bytes:
-        """校验信封发送者签名（audit R-06），返回发送者 fp。
-
-        信封 = 明文头(48) + 密文体 + 投递签名(72: ts(8)+sig(64))。
-        sig = Ed25519_sign(AUTH_INFO || 明文头(48B) || ts)。
-        未认证的投递被拒——否则任何知道 recv_fp 的人都能匿名灌满
-        256 条队列，把合法离线消息挤掉（无需知道任何密钥）。
-        """
+    def verify_sender(self, blob: bytes, envelope_len: int, now_skew: int=300) -> bytes:
         sender_fp = blob[12:20]
         if envelope_len < HEADER_SIZE or len(blob) < envelope_len + 72:
-            raise ValueError("missing sender proof")
+            raise ValueError('missing sender proof')
         ts = blob[envelope_len:envelope_len + 8]
         sig = blob[envelope_len + 8:envelope_len + 72]
-        if abs(time.time() - struct.unpack("<Q", ts)[0]) > now_skew:
-            raise ValueError("sender proof timestamp out of window")
+        if abs(time.time() - struct.unpack('<Q', ts)[0]) > now_skew:
+            raise ValueError('sender proof timestamp out of window')
         ed_pub = self._pubkeys.get(sender_fp)
         if ed_pub is None:
-            raise ValueError("sender not registered (auth first)")
+            raise ValueError('sender not registered (auth first)')
         from cryptography.hazmat.primitives.asymmetric import ed25519
         import hashlib
         try:
-            # audit R2-02: 验签绑定完整信封（SHA256(头+密文)），防止
-            # 拿合法 proof 换掉密文绕过去重/毁掉合法消息。
             digest = hashlib.sha256(blob[:envelope_len]).digest()
-            ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(
-                sig, DELIVERY_INFO + digest + ts)
+            ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(sig, DELIVERY_INFO + digest + ts)
         except Exception:
-            raise ValueError("bad sender proof")
+            raise ValueError('bad sender proof')
         return sender_fp
 
-    def accept(self, blob: bytes, verify: bool = True) -> dict:
-        """校验并投递一封信。返回 {'ok': True, 'msg_id': ...} 或抛 ValueError。
-
-        verify=False 仅用于测试（老测试与新测试构造裸信封）。
-        """
+    def accept(self, blob: bytes, verify: bool=True) -> dict:
         if len(blob) > MAX_ENVELOPE:
-            raise ValueError("envelope too large")
+            raise ValueError('envelope too large')
         if len(blob) < HEADER_SIZE:
-            raise ValueError("envelope too short")
+            raise ValueError('envelope too short')
         try:
-            m = parse_message(blob[:HEADER_SIZE] + blob[HEADER_SIZE:-72]
-                              if verify else blob)
+            m = parse_message(blob[:HEADER_SIZE] + blob[HEADER_SIZE:-72] if verify else blob)
         except ValueError as e:
-            raise ValueError(f"bad envelope: {e}")
-        if m["ptype"] == 0:                      # 0 不是合法 ptype
-            raise ValueError("invalid ptype")
-        recv_fp = m["recv_fp"]
-        if recv_fp == m["sender_fp"]:
-            raise ValueError("self-addressed")
+            raise ValueError(f'bad envelope: {e}')
+        if m['ptype'] == 0:
+            raise ValueError('invalid ptype')
+        recv_fp = m['recv_fp']
+        if recv_fp == m['sender_fp']:
+            raise ValueError('self-addressed')
         if verify:
-            self.verify_sender(blob, len(blob) - 72)   # envelope_len 不含 proof 后缀
-            blob = blob[:-72]              # 入队存裸信封，收件方无感
+            self.verify_sender(blob, len(blob) - 72)
+            blob = blob[:-72]
         if not self.store.put(recv_fp, blob):
-            # 重复信封（msg_id 去重命中）：幂等返回成功但不重复入队
-            return {"ok": True, "duplicate": True,
-                    "msg_id": _b64e(m["msg_id"]), "ptype": m["ptype"]}
-        return {"ok": True, "msg_id": _b64e(m["msg_id"]), "ptype": m["ptype"]}
-
-    # ---------- 取信 ----------
+            return {'ok': True, 'duplicate': True, 'msg_id': _b64e(m['msg_id']), 'ptype': m['ptype']}
+        return {'ok': True, 'msg_id': _b64e(m['msg_id']), 'ptype': m['ptype']}
 
     def register_pubkey(self, pub_material: bytes) -> bytes:
-        """AUTH 登记（TOFU：首见为准）。
-
-        安全（audit R-03）：中继从完整公钥材料 x||ed 自行计算指纹，
-        客户端无权自报地址——否则攻击者可用"任意 fp + 自己的钥匙"
-        抢注受害者桶（身份冒用/消息截获窗口）。
-        返回中继认定的 fp。
-        """
         if len(pub_material) != 64:
-            raise ValueError("pub material must be 64 bytes (x||ed)")
+            raise ValueError('pub material must be 64 bytes (x||ed)')
         fp = hashlib.sha256(pub_material).digest()[:8]
         ed_pub = pub_material[32:]
         if fp in self._pubkeys and self._pubkeys[fp] != ed_pub:
-            raise ValueError("fingerprint already bound to another key")
+            raise ValueError('fingerprint already bound to another key')
         self._pubkeys[fp] = ed_pub
         return fp
 
-    def authorize(self, fp: bytes, proof: bytes, now_skew: int = 300) -> bool:
-        """取信授权：Ed25519_sign(AUTH_INFO || fp || ts(8))，ts 在窗口内。"""
+    def authorize(self, fp: bytes, proof: bytes, now_skew: int=300) -> bool:
         import struct
         ed_pub = self._pubkeys.get(fp)
         if ed_pub is None or len(proof) != 64 + 8:
             return False
-        ts, sig = proof[:8], proof[8:]
-        if abs(time.time() - struct.unpack("<Q", ts)[0]) > now_skew:
+        ts, sig = (proof[:8], proof[8:])
+        if abs(time.time() - struct.unpack('<Q', ts)[0]) > now_skew:
             return False
         from cryptography.hazmat.primitives.asymmetric import ed25519
         from cryptography.hazmat.primitives import serialization
         try:
-            ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(
-                sig, AUTH_INFO + fp + ts)
+            ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(sig, AUTH_INFO + fp + ts)
             return True
         except Exception:
             return False
 
     def fetch(self, fp: bytes, proof: bytes) -> list[bytes]:
-        """授权通过 → 取走全部并清桶。"""
         if not self.authorize(fp, proof):
-            raise PermissionError("unauthorized")
+            raise PermissionError('unauthorized')
         return self.store.pop_all(fp)
 
     def inbox_count(self, fp: bytes) -> int:
         return self.store.count(fp)
 
-
-# ---------- HTTP 适配（stdlib, 无依赖；生产可换 ASGI） ----------
-
 def make_handler(logic: RelayLogic):
-    """返回一个可被 http.server / 任意框架调用的 (method, path, body) -> (status, json) 函数。"""
 
     def handle(method: str, path: str, body: bytes) -> tuple[int, dict]:
-        if method == "GET" and path == "/health":
-            return 200, {"ok": True}
-        if method == "POST" and path == "/envelope":
+        if method == 'GET' and path == '/health':
+            return (200, {'ok': True})
+        if method == 'POST' and path == '/envelope':
             try:
-                return 202, logic.accept(body)
+                return (202, logic.accept(body))
             except ValueError as e:
-                return 400, {"ok": False, "error": str(e)}
-        if method == "POST" and path == "/auth":
-            # body = pub_material(64) || ts(8) || sig(64)
-            # sig = Ed25519_sign(ed_priv, AUTH_INFO || pub_material || ts)
-            # 安全（R-03）：fp 由中继从 pub_material 计算，客户端不自报地址
+                return (400, {'ok': False, 'error': str(e)})
+        if method == 'POST' and path == '/auth':
             if len(body) != 64 + 8 + 64:
-                return 400, {"ok": False, "error": "bad auth payload"}
-            pub_material, ts, sig = body[:64], body[64:72], body[72:136]
-            if abs(time.time() - struct.unpack("<Q", ts)[0]) > 300:
-                return 400, {"ok": False, "error": "timestamp out of window"}
+                return (400, {'ok': False, 'error': 'bad auth payload'})
+            pub_material, ts, sig = (body[:64], body[64:72], body[72:136])
+            if abs(time.time() - struct.unpack('<Q', ts)[0]) > 300:
+                return (400, {'ok': False, 'error': 'timestamp out of window'})
             from cryptography.hazmat.primitives.asymmetric import ed25519
             ed_pub = pub_material[32:]
             try:
-                ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(
-                    sig, AUTH_INFO + pub_material + ts)
+                ed25519.Ed25519PublicKey.from_public_bytes(ed_pub).verify(sig, AUTH_INFO + pub_material + ts)
             except Exception:
-                return 403, {"ok": False, "error": "bad signature"}
+                return (403, {'ok': False, 'error': 'bad signature'})
             try:
                 fp = logic.register_pubkey(pub_material)
             except ValueError as e:
-                return 409, {"ok": False, "error": str(e)}
-            # audit R2-01: 响应附中继身份证明（relay_pub + 对 client_fp 的签名）。
-            # 客户端 TOFU-pin relay_pub 后可验证"对面确实是这台中继"，
-            # 恶意 endpoint 自报 {"fp": <我的fp>} 不再能骗过认证。
-            return 200, {"ok": True, "fp": _b64e(fp),
-                         "relay_pub": _b64e(logic.relay_pub),
-                         "relay_sig": _b64e(logic.relay_attestation(fp, ts))}
-        if method == "POST" and path.startswith("/inbox/"):
-            # 安全（audit R-04）：proof 不走 URL query——查询串会进
-            # 反代/边缘（Cloudflare）访问日志，5 分钟窗口内可重放。
-            # 改 POST body = ts(8) || sig(64)，与 /auth 同构；fp 取自 URL path。
+                return (409, {'ok': False, 'error': str(e)})
+            return (200, {'ok': True, 'fp': _b64e(fp), 'relay_pub': _b64e(logic.relay_pub), 'relay_sig': _b64e(logic.relay_attestation(fp, ts))})
+        if method == 'POST' and path.startswith('/inbox/'):
             if len(body) != 8 + 64:
-                return 400, {"ok": False, "error": "bad proof payload"}
-            fp_b64 = path.split("/inbox/", 1)[1]
+                return (400, {'ok': False, 'error': 'bad proof payload'})
+            fp_b64 = path.split('/inbox/', 1)[1]
             try:
                 fp = _b64d(fp_b64)
             except Exception:
-                return 400, {"ok": False, "error": "bad fingerprint"}
+                return (400, {'ok': False, 'error': 'bad fingerprint'})
             if len(fp) != 8:
-                return 400, {"ok": False, "error": "bad fingerprint"}
-            ts, sig = body[:8], body[8:72]
-            if abs(time.time() - struct.unpack("<Q", ts)[0]) > 300:
-                return 403, {"ok": False, "error": "timestamp out of window"}
+                return (400, {'ok': False, 'error': 'bad fingerprint'})
+            ts, sig = (body[:8], body[8:72])
+            if abs(time.time() - struct.unpack('<Q', ts)[0]) > 300:
+                return (403, {'ok': False, 'error': 'timestamp out of window'})
             try:
                 envs = logic.fetch(fp, ts + sig)
-                return 200, {"ok": True,
-                             "envelopes": [_b64e(e) for e in envs]}
+                return (200, {'ok': True, 'envelopes': [_b64e(e) for e in envs]})
             except PermissionError:
-                return 403, {"ok": False, "error": "unauthorized"}
+                return (403, {'ok': False, 'error': 'unauthorized'})
             except Exception:
-                return 400, {"ok": False, "error": "bad request"}
-        return 404, {"ok": False, "error": "not found"}
-
+                return (400, {'ok': False, 'error': 'bad request'})
+        return (404, {'ok': False, 'error': 'not found'})
     return handle
 
-
 class RelayServer:
-    """stdlib http.server 包装，测试与小部署用。"""
 
-    def __init__(self, logic: RelayLogic | None = None, port: int = 8765):
+    def __init__(self, logic: RelayLogic | None=None, port: int=8765):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         self.logic = logic or RelayLogic(MemoryStore())
         self.port = port
         handler = make_handler(self.logic)
 
         class H(BaseHTTPRequestHandler):
+
             def _run(self):
-                body = b""
-                if self.headers.get("Content-Length"):
-                    body = self.rfile.read(int(self.headers["Content-Length"]))
+                body = b''
+                if self.headers.get('Content-Length'):
+                    body = self.rfile.read(int(self.headers['Content-Length']))
                 status, obj = handler(self.command, self.path, body)
                 data = json.dumps(obj).encode()
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
-
             do_GET = do_POST = _run
 
-            def log_message(self, *a):      # 测试时静音
+            def log_message(self, *a):
                 pass
-
-        self._httpd = HTTPServer(("127.0.0.1", port), H)
+        self._httpd = HTTPServer(('127.0.0.1', port), H)
 
     def serve_forever(self):
         self._httpd.serve_forever()
 
     def serve_until_stop(self):
-        self._httpd.handle_request()        # 处理一个请求即返回（测试用）
+        self._httpd.handle_request()
