@@ -57,11 +57,18 @@ def main(argv=None):
     fs.add_argument('outfile')
     fs.add_argument('--my-id', default='nbx_id.key')
     fs.add_argument('--to-pub', required=True, help='接收方身份公钥文件(Base64)')
-    un = sub.add_parser('unseal', help='解密前向保密信封')
+    un = sub.add_parser('unseal', help='解密前向保密信封',
+                        description='解密前向保密信封。发送方公钥可信性：给出 --from-fp 时显式核对指纹；'
+                                    '否则按 --from-name（默认 --from-pub 绝对路径）首次信任(TOFU)，'
+                                    '指纹写入 pin 文件，之后同一名字换密钥将被拒绝。')
     un.add_argument('infile')
     un.add_argument('outfile')
     un.add_argument('--my-id', default='nbx_id.key')
     un.add_argument('--from-pub', required=True, help='发送方身份公钥文件(Base64)')
+    un.add_argument('--from-fp', default=None, help='发送方公钥指纹(hex)，显式核对；不一致则拒绝且不写 outfile')
+    un.add_argument('--from-name', default=None, help='TOFU pin 使用的发送方名字（默认 --from-pub 的绝对路径）')
+    un.add_argument('--pins', default=None,
+                    help='发送方指纹 pin 文件（默认 ~/.nbx_sender_pins.json，可用 NBX_SENDER_PINS 覆盖）')
     an = sub.add_parser('anon', help='Anonymity Wrapper: 元数据加密外层')
     an.add_argument('action', choices=['pack', 'unpack'])
     an.add_argument('infile')
@@ -73,11 +80,18 @@ def main(argv=None):
     pqc.add_argument('outfile')
     pqc.add_argument('--my-id', default='nbx_id.key')
     pqc.add_argument('--to-pub', required=True)
-    pqu = sub.add_parser('pqunseal', help='解封后量子信封')
+    pqu = sub.add_parser('pqunseal', help='解封后量子信封',
+                         description='解封后量子混合信封。发送方公钥可信性：给出 --from-fp 时显式核对指纹；'
+                                     '否则按 --from-name（默认 --from-pub 绝对路径）首次信任(TOFU)，'
+                                     '指纹写入 pin 文件，之后同一名字换密钥将被拒绝。')
     pqu.add_argument('infile')
     pqu.add_argument('outfile')
     pqu.add_argument('--my-id', default='nbx_id.key')
     pqu.add_argument('--from-pub', required=True)
+    pqu.add_argument('--from-fp', default=None, help='发送方公钥指纹(hex)，显式核对；不一致则拒绝且不写 outfile')
+    pqu.add_argument('--from-name', default=None, help='TOFU pin 使用的发送方名字（默认 --from-pub 的绝对路径）')
+    pqu.add_argument('--pins', default=None,
+                     help='发送方指纹 pin 文件（默认 ~/.nbx_sender_pins.json，可用 NBX_SENDER_PINS 覆盖）')
     rl = sub.add_parser('relay', help='启动中继服务器（密文搬运工）')
     rl.add_argument('--port', type=int, default=8765)
     rl.add_argument('--state-dir', default='.', help='relay 签名密钥存放目录 (audit R2-10)')
@@ -204,7 +218,9 @@ def main(argv=None):
     elif args.cmd == 'unseal':
         from . import fskey, replay
         ident = fskey.Identity.load(args.my_id)
-        from_x, from_ed = fskey.Identity.parse_public(open(args.from_pub).read().strip())
+        pub_text = open(args.from_pub).read().strip()
+        _verify_from_pub(args, pub_text)
+        from_x, from_ed = fskey.Identity.parse_public(pub_text)
         env = open(args.infile, 'rb').read()
         cache = replay.ReplayCache()
         try:
@@ -245,7 +261,9 @@ def main(argv=None):
     elif args.cmd == 'pqunseal':
         from . import pq, replay
         ident = pq.PQIdentity.load(args.my_id)
-        snd = pq.PQIdentity.parse_public(open(args.from_pub).read().strip())
+        pub_text = open(args.from_pub).read().strip()
+        _verify_from_pub(args, pub_text)
+        snd = pq.PQIdentity.parse_public(pub_text)
         env = open(args.infile, 'rb').read()
         cache = replay.ReplayCache()
         try:
@@ -277,6 +295,23 @@ def main(argv=None):
         from .fskey import Identity
         ident = Identity.load(args.my_id)
         run_chat(ident, args.to_pub, args.relay, speaks_first=False, poll=args.poll)
+
+def _verify_from_pub(args, pub_text: str):
+    from . import pins
+    try:
+        fp = pins.pubkey_fingerprint(pub_text)
+    except Exception:
+        sys.exit(f'invalid --from-pub public key material: {args.from_pub}')
+    if getattr(args, 'from_fp', None):
+        if pins._normalize_fp(args.from_fp) != fp:
+            sys.exit(f'fingerprint mismatch: --from-fp={args.from_fp} but {args.from_pub} fingerprint is {fp}')
+        return
+    name = getattr(args, 'from_name', None) or os.path.abspath(args.from_pub)
+    try:
+        store = pins.PinStore(getattr(args, 'pins', None))
+        store.trust(name, fp)
+    except ValueError as e:
+        sys.exit(f'--from-pub trust check failed: {e}')
 
 def _read_key(path: str) -> bytes:
     try:
