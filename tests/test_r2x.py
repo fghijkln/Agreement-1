@@ -56,13 +56,22 @@ def test_r2_09_corrupt_pin_file_tolerated(tmp_path):
     assert isinstance(st._relay_pins, dict)
 
 def test_r2_08_python_memory_store_budget_unchanged():
-    from nbx.relay import MemoryStore, RelayLogic
-    st = MemoryStore(max_total_bytes=1024)
-    logic = RelayLogic(st)
-    ok = True
+    from nbx.relay import MemoryStore
+    st = MemoryStore(max_total_bytes=1024, ttl=10 ** 9)
+    fp = b'F' * 8
+    accepted = 0
+    raised = False
     try:
         for i in range(100):
-            st.put('fp' * 4, i, b'x' * 100)
-    except Exception:
-        ok = False
-    assert ok is False or st.total_bytes() <= 1024
+            env = bytes([i]) + b'\xab' * 99
+            st.put(fp, env)
+            accepted += 1
+            assert st._total_bytes <= 1024
+    except ValueError as e:
+        raised = True
+        assert str(e) == 'global envelope budget exceeded'
+    assert raised is True, '超过 max_total_bytes 必须抛出预算异常'
+    assert st._total_bytes <= 1024
+    assert accepted == 10
+    assert st.count(fp) == accepted
+
