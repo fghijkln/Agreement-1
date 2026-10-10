@@ -174,12 +174,13 @@ def test_http_server_live(tmp_path):
     t = threading.Thread(target=serve, daemon=True)
     t.start()
     time.sleep(0.2)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:18765/envelope', data=b'garbage', method='POST'), timeout=5)
+        opener.open(urllib.request.Request('http://127.0.0.1:18765/envelope', data=b'garbage', method='POST'), timeout=5)
         raise AssertionError('garbage accepted')
     except urllib.error.HTTPError as e:
         assert e.code == 400
-    resp = urllib.request.urlopen('http://127.0.0.1:18765/health', timeout=5)
+    resp = opener.open('http://127.0.0.1:18765/health', timeout=5)
     assert resp.status == 200 and json.loads(resp.read())['ok']
     print('✓ 真实 HTTP 服务：/envelope 400, /health 200')
 
