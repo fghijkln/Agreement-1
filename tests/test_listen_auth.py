@@ -225,6 +225,13 @@ def test_out_of_order_chunk_does_not_kill_listener(tmp_path):
         ftype, payload = protocol.recv_frame(sock)
         assert payload == b'GO', payload
         sock.sendall(protocol.chunk_frame(7, b'ab'))
+        # 等服务端处理完并关闭连接（清理半途文件发生在关闭连接之前），消除竞态
+        sock.settimeout(5)
+        try:
+            while sock.recv(4096):
+                pass
+        except OSError:
+            pass
     assert not list(outdir.glob('*')), '序号错乱的半途文件不得残留'
     assert srv.is_alive()
     with socket.create_connection(('127.0.0.1', port), timeout=5) as sock:
