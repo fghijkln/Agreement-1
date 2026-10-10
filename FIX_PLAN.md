@@ -322,3 +322,81 @@ pnpm install --frozen-lockfile && pnpm test
 ```
 docs: FIX_PLAN.md 审计修复清单
 ```
+
+---
+
+# 第二轮修复（`f6af1c3` 之后）
+
+依据：上一轮“残留风险 / 未做事项”第 1–6 条（对应审计 T4、2.2 节、5.1、5.3）。
+原则：每项单独提交、带回归测试、全套测试通过后再提交；旧格式数据可读并迁移；未 push。
+上文第一轮“残留风险”第 1–6 条已在本轮处理，状态以本章为准。
+
+## R2-1. `7ca9fe9` fix(storage): 会话状态 / 消息历史 / outbox 静态加密
+
+- 审计项：T4（历史/会话/outbox 明文落盘）、2.2 节（明文棘轮状态绕过 FS）。
+- 改动：
+  - 新增 `nbx/storage.py`：格式 `b'NBXSEAL1' | ver=0x01 | nonce(12) | ChaCha20-Poly1305`；AAD = 头部 + 调用方 context（绑定用途/位置，防跨文件挪用）；`derive_storage_key()` 用 HKDF-SHA256（`info=b'nbx-at-rest-v1|'+purpose`）做域分离；`atomic_write()`（同目录 mkstemp + fchmod 0600 + fsync + `os.replace`）；`append_line()`（`O_APPEND|O_CREAT`，0600）；jsonl 逐行加密（前缀 `nbxseal1:`）。
+  - `nbx/daemon.py`：`Daemon(..., storage_secret=None)`，默认由身份私钥派生存储密钥（身份用 passphrase 加密时，目录被整体拷走也无法解出）；`save_session` 加密 + 原子写，AAD=`session|peer_fp`；`load_session` 兼容旧明文；`log_message`/`enqueue_outbox` 加密追加；`history`/`flush_outbox` 兼容新旧行，认证失败行丢弃并记事件；`_migrate_at_rest()` 在启动时把旧明文 `messages/*.jsonl`、`outbox.jsonl`、`sessions/*.session` 迁移为加密格式；混有旧明文行的文件在下次写入时迁移。
+  - `nbx/contacts.py`：`ContactBook(path, storage_key=None)`，给出密钥时会话状态存为 `session_enc`（AEAD，AAD 绑定联系人指纹），旧 `session` 明文字段可读并在下次 `save()` 迁移；文件一律 0600 原子写。
+- 测试：`tests/test_at_rest_encryption.py`（19 例）——磁盘不含明文（会话 root key / 状态 / 消息文本）、0600、无残留 tmp、篡改拒绝（逐字节位置参数化）、跨 peer 挪用拒绝、跨日文件挪行拒绝、错误密钥拒绝、旧明文会话/历史/outbox 迁移、ContactBook 加密与迁移与篡改。`tests/test_daemon.py::test_async_handshake_and_outbox` 原断言“outbox 明文含 hello-async”改为“磁盘不含明文 + 解密后恰一条”（被修复的正是这个属性）。
+
+## R2-2. `129fcd8` fix(carrier): 元数据完整性
+
+- 审计项：T4（Carrier 元数据无完整性）。
+- 改动：
+  - `nbx/crypto.py`：`encrypt/decrypt` 增加可选 `aad` 参数（默认 None，向后兼容）。
+  - `nbx/carrier.py`：`encrypt_carrier()` 把整个 meta（规范化 JSON，含 `parts`/`filename`/`type`）+ flags 作为 AEAD associated data，meta 标记 `aad: "meta-v1"`；`decrypt_streams()` 对新格式校验 AAD，剥掉标记降级会因 AEAD 失败被拒；旧格式（无标记）与旧 transfer `auto` 格式兼容解密。明文载体（无密钥，无法 MAC）在 `unpack` 做结构一致性校验：`len(parts)==len(streams)`、逐部分 `len`、文本类型必须是 TLV_TEXT 流、bundle 必须有 parts；`extract` 对 bundle 不一致显式 `NBXError`。
+  - `nbx/cli.py` convert/extract、`nbx/viewer.py`、`nbx/transfer.py`（自动加密改为标准加密载体）统一走上述 API；`extract` 拒绝 `..`/空名，路径只取 basename。
+- 测试：`tests/test_carrier_meta_integrity.py`（17 例）——改 filename/type/parts 顺序/增删 part/part 名/新增字段、剥 aad 标记、改 flags 均被拒；旧加密格式与旧 auto 格式可读；明文载体 parts 数/长度/类型伪造被拒；压缩 bundle 仍有效；CLI convert→extract 往返与篡改拒绝、不安全文件名拒绝。`tests/test_listen_auth.py::_decrypt_payload` 改用 `carrier.decrypt_streams`（格式变更）。
+
+## R2-3. `6193a6a` fix(pins): TOFU 指纹 128 位 + 验证后才写 pin
+
+- 改动：`nbx/pins.py` 指纹 `sha256(pub)[:16]`（32 hex）；`fp_matches()` 接受旧 8 字节（前缀匹配，`hmac.compare_digest`）；`PinStore.check()` 只读校验、`commit()` 写入/升级（旧 8 字节 pin 匹配后升级为 16 字节）、`trust()` 保留为兼容 API。`nbx/cli.py::_verify_from_pub` 解密前只做 `check`，返回回调，`unseal`/`pqunseal` 在 `open_envelope`/`open_pq` 成功（验签+解密+防重放）后才 `commit`；旧 64 位 `--from-fp` 仍接受但打印警告。
+- 测试：`tests/test_pin_upgrade.py`（8 例）——128 位指纹、旧 pin 接受并升级、旧 pin 不匹配拒绝且不改写、旧 `--from-fp` 接受、非法长度拒绝、首次冒充/篡改信封时不写 pin、`check` 只读。原 `tests/test_from_pub_pin.py` 12 例不变全部通过。
+
+## R2-4. `57b0548` fix(cli): ResourceWarning
+
+- 改动：`nbx/cli.py` 全部 `open()` 改为 `with`（`_read_text`/`_read_bytes`）；`pyproject.toml` 新增 `[tool.pytest.ini_options] filterwarnings = ["error::ResourceWarning", "error::pytest.PytestUnraisableExceptionWarning"]`。开启后暴露 3 处**测试自身**泄漏（`test_relay.py` 未关闭的 HTTPError/响应/服务端 socket，`test_nbx.py` 子进程 stdout 管道，新测试中的 `open().read()`），已修正测试代码；`nbx/relay.py::RelayServer` 新增 `close()`。
+- 测试：`tests/test_cli_resource_warning.py`（AST 检查 cli 无裸 `open`、检测器自检、identity/pubout/seal/unseal 全流程无 ResourceWarning）。
+
+## R2-5. `58aa1de` fix(contacts): SOCKS 超时
+
+- 改动（OpenCode 实现，人工复核并补充）：`TransportStack(..., socks_timeout=10.0, io_deadline=30.0)`；`_socks_connect` 用 `socks_timeout` 建连并 `settimeout`，握手 `_recv_exact` 读满（EOF→`ConnectionError`，不再 `IndexError`），按 ATYP（IPv4/IPv6/域名）读完 BND.ADDR+PORT，失败必关 socket；`_recv_all(s, deadline, limit)` 带总时限；`_http_post` 代理分支、`_send_via_anon`、`poll()` 非 relay 分支统一使用，socket 在 finally 关闭。
+- 测试：`tests/test_socks_timeout.py`（6 例）——黑洞代理建连/发送 3 秒内失败、CONNECT 成功后静默按 `io_deadline` 失败、短回复抛 `ConnectionError`、域名型回复被完整消费、默认值可配置。
+
+## R2-6. `c682773` fix(errors): 对外错误不泄露细节
+
+- 改动：新增 `nbx/errors.py`：`classify()` 粗分类（auth/timeout/network/format/state/internal），`public_message()` 返回固定文案并把异常类型/原文/堆栈写 `logging.getLogger('nbx')` DEBUG；`NBX_DEBUG=1` 时 CLI 输出 debug。覆盖：cli `unseal`/`pqunseal`（统一 “wrong key, tampered, replayed or expired envelope”，不再区分签名/时间/重放）、`anon unpack`、`extract`；daemon `events.log`（poll/信封处理只记分类）与 IPC 错误响应（抽出 `_ipc_dispatch`）；transfer `listen`；chat 轮询；`TransportResult.detail`。
+- 测试：`tests/test_error_leakage.py`（12 例）——固定文案 + DEBUG 有细节、INFO 级无细节、分类、events.log/IPC/CLI/transport detail 不含异常原文/路径/地址/堆栈。
+
+## R2-7. `64b1d60` ci(bandit): 门禁
+
+- 改动：`.github/workflows/bandit.yml` 去掉 `|| true`；SARIF 报告步骤改 `--exit-zero`（只负责生成报告上传），新增 “Bandit gate” 步骤 `--severity-level medium --confidence-level medium`，有中/高危发现即失败；`bandit.toml` 补充门禁说明与 `daemon._migrate_at_rest` 的 B112 说明。
+- 本地验证：`bandit 1.9.4`（uv 装入 .venv），CI 同参数：**0 issues（Low/Medium/High 均 0）**；不带 `--skip` 的全量扫描仅剩 bandit.toml 已登记的豁免类（B103/B104/B108/B110/B112/B310/B404/B603/B607）。用含 `pickle.loads` 的临时文件验证门禁命令返回 1。
+
+## 第二轮汇总表
+
+| 提交 | 审计项 | 文件 | 测试 |
+|---|---|---|---|
+| `7ca9fe9` | T4 明文落盘 / 2.2 | storage.py, daemon.py, contacts.py | test_at_rest_encryption.py, test_daemon.py |
+| `129fcd8` | T4 Carrier 元数据 | carrier.py, crypto.py, cli.py, transfer.py, viewer.py | test_carrier_meta_integrity.py, test_listen_auth.py |
+| `6193a6a` | TOFU 指纹/写入时机 | pins.py, cli.py | test_pin_upgrade.py |
+| `57b0548` | 5.1 ResourceWarning | cli.py, relay.py, pyproject.toml | test_cli_resource_warning.py, test_relay.py, test_nbx.py |
+| `58aa1de` | T4 SOCKS 超时 | contacts.py | test_socks_timeout.py |
+| `c682773` | T4 日志泄露 | errors.py, cli.py, daemon.py, contacts.py, transfer.py, chat.py | test_error_leakage.py |
+| `64b1d60` | 5.3 CI bandit | bandit.yml, bandit.toml | 本地 bandit |
+
+## 第二轮验证结果
+
+- `.venv/bin/python -m pytest -q` → **227 passed, 1 skipped**（基线 162 passed, 1 skipped；ResourceWarning 设为 error 下连续多次运行稳定）。
+- bandit 1.9.4（CI 同参数）→ 0 issues。
+
+## 第二轮残留风险
+
+1. **静态加密的密钥来源**：默认存储密钥由身份私钥派生；若身份文件未用 passphrase 加密且与状态在同一目录，整目录拷走仍可解密——真正的静态保护依赖 `--passphrase` 加密身份或外部 `storage_secret`。`ContactBook` 只有显式传 `storage_key` 才加密（默认仍明文，兼容现有调用方）。`events.log` 与 `.epoch` 仍明文（只含指纹/计数器/固定事件文案，无消息内容）。jsonl 同一文件内的行删除/重排不可检测；整目录回滚（R2_06_BOUNDARY）仍需外部锚点。
+2. **跨版本兼容**：新版写出的加密会话/历史，旧版程序无法读取（单向迁移）；新版 `send` 自动加密的载体带 AAD，旧版接收端 `extract` 会解密失败。
+3. **Carrier**：无密钥的明文载体无法认证，只做结构一致性校验（任何人可整体伪造）；旧格式加密载体（无 `aad` 标记）元数据仍未认证。
+4. **TOFU**：首次信任仍是 TOFU（解密成功只证明“信封由该公钥签名”，不证明公钥属于声称的人）；旧 64 位 `--from-fp` 为兼容仍被接受（有警告）。`contacts.py` 读取中继 pin 文件失败时仍静默忽略（B110，等价于重新 TOFU）。
+5. **SOCKS/poll**：单 endpoint 最长约 `socks_timeout + io_deadline`，`poll()` 对多个 endpoint 无全局总时限、无失败退避。
+6. **错误文案**：relay HTTP 400/409 仍返回 relay 自身的固定 ValueError 文案；pin 不一致提示仍含本机 pin 文件路径与指纹（面向本地操作者，属有意保留）。
+7. **CI**：bandit 门禁阈值为 medium+；`tools/build_deb.py` 仍有裸 `open()`（不在 cli 范围、构建脚本）；ResourceWarning-as-error 仅在本地 3.12 验证，其他版本 GC 时序差异可能需观察。
