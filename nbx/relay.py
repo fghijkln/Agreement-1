@@ -46,8 +46,14 @@ class MemoryStore:
     def _gc(self, fp: bytes):
         now = time.time()
         q = self._q.get(fp, [])
-        kept = [(t, e) for t, e in q if now - t < self.ttl]
-        for _, e in q[len(kept):]:
+        kept = []
+        expired = []
+        for t, e in q:
+            if now - t < self.ttl:
+                kept.append((t, e))
+            else:
+                expired.append(e)
+        for e in expired:
             self._total_bytes -= len(e)
         self._q[fp] = kept
         self._seen = {mid: t for mid, t in self._seen.items() if now - t < self.ttl}
@@ -72,16 +78,18 @@ class MemoryStore:
         return True
 
     def pop_all(self, recv_fp: bytes) -> list[bytes]:
-        self._gc(recv_fp)
-        out = [e for _, e in self._q.get(recv_fp, [])]
-        for e in out:
-            self._total_bytes -= len(e)
-        self._q[recv_fp] = []
-        return out
+        with self._lock:
+            self._gc(recv_fp)
+            out = [e for _, e in self._q.get(recv_fp, [])]
+            for e in out:
+                self._total_bytes -= len(e)
+            self._q[recv_fp] = []
+            return out
 
     def count(self, recv_fp: bytes) -> int:
-        self._gc(recv_fp)
-        return len(self._q.get(recv_fp, []))
+        with self._lock:
+            self._gc(recv_fp)
+            return len(self._q.get(recv_fp, []))
 
 def load_or_create_relay_key(path: str):
     import base64
