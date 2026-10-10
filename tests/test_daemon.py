@@ -34,7 +34,9 @@ def test_async_handshake_and_outbox(tmp_path):
     r = a.handle_ipc({'cmd': 'send', 'pub': pub_b, 'text': 'hello-async'})
     assert r['queued'] is True
     assert len(a.client.posted) == 1
-    assert a._outbox_path().read_text().count('hello-async') == 1
+    # outbox 现为静态加密：磁盘上不含明文，解密后恰有一条
+    assert 'hello-async' not in a._outbox_path().read_text()
+    assert [e['text'] for e, _ in a._read_jsonl(a._outbox_path())] == ['hello-async']
     a_hs = a.client.posted[0]
     b.client.inbox = [a_hs]
     b.my_fp = __import__('nbx.chat', fromlist=['fingerprint8']).fingerprint8(b.export_public())

@@ -11,6 +11,7 @@ import urllib.error
 from . import message as msg
 from .fskey import Identity
 from .ratchet import RatchetSession
+from . import storage
 LAYER_P2P = 1
 LAYER_ANON = 2
 LAYER_RELAY = 3
@@ -47,15 +48,35 @@ class Contact:
         return used[-1] if used else None
 
 class ContactBook:
+    """通讯录。传入 storage_key（32B，见 nbx.storage.derive_storage_key）时，
+    会话状态以 AEAD 加密存为 'session_enc'；旧版明文 'session' 字段仍可读取，
+    并在下一次 save() 时迁移为加密格式。文件以 0600 原子写入。"""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, storage_key: bytes | None=None):
         self.path = path
+        self._key = storage_key
         self._c: dict[str, Contact] = {}
+        self._opaque_enc: dict[str, str] = {}
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
             for k, v in raw.items():
-                self._c[k] = Contact(v['pub'], v.get('session'), v.get('addrs'), v.get('pref'))
+                state = v.get('session')
+                enc = v.get('session_enc')
+                if enc is not None:
+                    if self._key is None:
+                        self._opaque_enc[k] = enc
+                        state = None
+                    else:
+                        try:
+                            state = storage.open_sealed(self._key, base64.b64decode(enc), self._ctx(k)).decode('ascii')
+                        except (storage.StorageError, ValueError):
+                            state = None
+                self._c[k] = Contact(v['pub'], state, v.get('addrs'), v.get('pref'))
+
+    @staticmethod
+    def _ctx(b32: str) -> bytes:
+        return b'contact-session|' + b32.encode('ascii')
 
     def save(self):
 
@@ -63,11 +84,21 @@ class ContactBook:
             if isinstance(v, bytes):
                 return _b64e(v)
             return v
-        data = {fp_b32(c.fp): {'pub': c.pub_b64, 'session': enc(c.session_state), 'addrs': c.addrs, 'pref': c.pref} for c in self._c.values()}
-        tmp = self.path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=1)
-        os.replace(tmp, self.path)
+        data = {}
+        for c in self._c.values():
+            k = fp_b32(c.fp)
+            entry = {'pub': c.pub_b64, 'addrs': c.addrs, 'pref': c.pref}
+            st = enc(c.session_state)
+            if self._key is not None and st is not None:
+                entry['session'] = None
+                entry['session_enc'] = _b64e(storage.seal(self._key, st.encode('utf-8'), self._ctx(k)))
+            elif st is None and k in self._opaque_enc:
+                entry['session'] = None
+                entry['session_enc'] = self._opaque_enc[k]
+            else:
+                entry['session'] = st
+            data[k] = entry
+        storage.atomic_write(self.path, json.dumps(data, indent=1).encode('utf-8'))
 
     def add(self, pub_b64: str, pref: list[int] | None=None) -> Contact:
         c = Contact(pub_b64, pref=pref)

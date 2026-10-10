@@ -10,6 +10,7 @@ from .fskey import Identity
 from .chat import RelayClient, auth_proof, fingerprint8, _urlopen_retry, delivery_proof
 from .ratchet import RatchetSession, HandshakeStale, handshake_age
 from . import message as msg
+from . import storage
 DAEMON_MAGIC = b'NBXDAEMON1'
 IPC_VERSION = 1
 
@@ -85,7 +86,7 @@ R2_06_BOUNDARY = ("sessions 目录整体回滚(含 epoch log)不受本机制保�
 
 class Daemon:
 
-    def __init__(self, state_dir: str, relay_url: str, poll_interval: float=3.0, passphrase: str | None=None):
+    def __init__(self, state_dir: str, relay_url: str, poll_interval: float=3.0, passphrase: str | None=None, storage_secret: bytes | None=None):
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / 'messages').mkdir(exist_ok=True)
@@ -111,6 +112,12 @@ class Daemon:
                 self.identity.save(str(id_path))
                 os.chmod(id_path, 384)
         self.my_fp = fingerprint8(self.identity.export_public())
+        # 静态加密密钥：默认由身份私钥经 HKDF 域分离派生（身份文件用 passphrase
+        # 加密时，状态目录被整体拷走也无法解出会话/历史）；也可显式传入
+        # storage_secret（如 keyfile 主密钥）。
+        self._migrated: set[Path] = set()
+        self._storage_key = storage.derive_storage_key(storage_secret or self.identity.to_bytes(), b'daemon-state')
+        self._migrate_at_rest()
         self.client = RelayClient(relay_url)
         self.contacts: dict[str, ContactSession] = {}
         self._pending_hs: dict[bytes, RatchetSession] = {}
@@ -160,10 +167,8 @@ class Daemon:
         if cs.session is None:
             return
         blob = cs.session.export_state()
-        tmp = self._session_path(cs).with_suffix('.tmp')
-        tmp.write_bytes(blob)
-        os.replace(tmp, self._session_path(cs))
-        os.chmod(self._session_path(cs), 384)
+        sealed = storage.seal(self._storage_key, blob, self._session_ctx(cs.peer_fp))
+        storage.atomic_write(self._session_path(cs), sealed)
         recv_n, send_n = _progress_of(cs.session)
         ep = self._epoch_log_path(cs.peer_fp)
         with open(ep, 'a') as f:
@@ -182,8 +187,11 @@ class Daemon:
         p = self._session_path(cs)
         if not p.exists() or cs.session is not None:
             return
-        rs = RatchetSession()
-        rs.import_state(p.read_bytes())
+        raw = p.read_bytes()
+        if storage.is_sealed(raw):
+            raw = storage.open_sealed(self._storage_key, raw, self._session_ctx(cs.peer_fp))
+        # else: 旧版明文状态，照常导入；下次 save_session 以加密格式覆盖（迁移）
+        rs = RatchetSession.import_state(raw)
         ep = self._epoch_log_path(cs.peer_fp)
         if ep.exists():
             with open(ep) as f:
@@ -195,11 +203,70 @@ class Daemon:
                     raise RuntimeError(f'session state rollback detected for peer {_b64e(cs.peer_fp)}: state progress {progress} < epoch log {last} — refusing to load (possible restore attack; delete BOTH files to reset)')
         cs.session = rs
 
+    @staticmethod
+    def _session_ctx(peer_fp: bytes) -> bytes:
+        return b'session|' + peer_fp
+
+    @staticmethod
+    def _jsonl_ctx(path: Path) -> bytes:
+        return b'jsonl|' + path.name.encode('utf-8')
+
+    def _read_jsonl(self, path: Path) -> list[tuple[dict, str]]:
+        """读取 jsonl：兼容旧明文行与新加密行；认证失败的行丢弃并记事件。"""
+        out = []
+        ctx = self._jsonl_ctx(path)
+        bad = 0
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if not line.strip():
+                continue
+            try:
+                if storage.is_sealed_line(line):
+                    out.append((json.loads(storage.open_line(self._storage_key, line, ctx)), line))
+                else:
+                    out.append((json.loads(line), storage.seal_line(self._storage_key, line, ctx)))
+            except (storage.StorageError, ValueError):
+                bad += 1
+        if bad:
+            self.log_event(f'{path.name}: {bad} 条记录认证失败已忽略')
+        return out
+
+    def _migrate_jsonl(self, path: Path) -> None:
+        if path in self._migrated or not path.exists():
+            return
+        lines = path.read_text(encoding='utf-8').splitlines()
+        if all(storage.is_sealed_line(l) or not l.strip() for l in lines):
+            os.chmod(path, 0o600)
+        else:
+            ctx = self._jsonl_ctx(path)
+            new = [l if storage.is_sealed_line(l) else storage.seal_line(self._storage_key, l, ctx) for l in lines if l.strip()]
+            storage.atomic_write(path, ''.join(l + '\n' for l in new).encode('utf-8'))
+        self._migrated.add(path)
+
+    def _migrate_at_rest(self) -> None:
+        """把旧版明文的消息历史 / outbox / 会话状态迁移为加密格式。"""
+        for f in sorted((self.state_dir / 'messages').glob('*.jsonl')):
+            self._migrate_jsonl(f)
+        self._migrate_jsonl(self._outbox_path())
+        for f in sorted((self.state_dir / 'sessions').glob('*.session')):
+            raw = f.read_bytes()
+            if storage.is_sealed(raw):
+                continue
+            try:
+                peer_fp = _b64d(f.stem)
+                RatchetSession.import_state(raw)
+            except Exception:
+                continue  # 损坏的旧文件原样保留，由 load_session 报错
+            storage.atomic_write(f, storage.seal(self._storage_key, raw, self._session_ctx(peer_fp)))
+
+    def _append_sealed(self, path: Path, record: dict) -> None:
+        self._migrate_jsonl(path)
+        line = storage.seal_line(self._storage_key, json.dumps(record, ensure_ascii=False), self._jsonl_ctx(path))
+        storage.append_line(path, line)
+
     def log_message(self, direction: str, peer_fp: bytes, text: str) -> None:
         day = time.strftime('%Y-%m-%d')
         entry = {'ts': time.time(), 'dir': direction, 'peer': _b64e(peer_fp), 'text': text}
-        with open(self.state_dir / 'messages' / f'{day}.jsonl', 'a') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        self._append_sealed(self.state_dir / 'messages' / f'{day}.jsonl', entry)
 
     def log_event(self, text: str) -> None:
         day = time.strftime('%Y-%m-%d')
@@ -212,8 +279,7 @@ class Daemon:
 
     def enqueue_outbox(self, peer_pub: str, text: str) -> None:
         entry = {'ts': time.time(), 'pub': peer_pub, 'text': text}
-        with open(self._outbox_path(), 'a') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        self._append_sealed(self._outbox_path(), entry)
 
     def flush_outbox(self) -> int:
         p = self._outbox_path()
@@ -221,17 +287,14 @@ class Daemon:
             return 0
         remain = []
         sent = 0
-        for line in p.read_text().splitlines():
-            e = json.loads(line)
+        for e, sealed_line in self._read_jsonl(p):
             cs = self.contacts.get(e['pub'])
             if cs is not None and cs.session is not None:
                 cs.send_text(e['text'])
                 sent += 1
             else:
-                remain.append(line)
-        tmp = p.with_suffix('.tmp')
-        tmp.write_text('\n'.join(remain) + ('\n' if remain else ''))
-        os.replace(tmp, p)
+                remain.append(sealed_line)
+        storage.atomic_write(p, ''.join(l + '\n' for l in remain).encode('utf-8'))
         if sent:
             self.log_event(f'outbox 补发 {sent} 条')
         return sent
@@ -243,9 +306,8 @@ class Daemon:
         want = _b64e(cs.peer_fp)
         out = []
         for day_file in sorted((self.state_dir / 'messages').glob('*.jsonl'), reverse=True):
-            for line in reversed(day_file.read_text().splitlines()):
-                e = json.loads(line)
-                if e['peer'] == want:
+            for e, _ in reversed(self._read_jsonl(day_file)):
+                if e.get('peer') == want:
                     out.append(e)
                     if len(out) >= limit:
                         return list(reversed(out))
