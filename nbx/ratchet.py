@@ -1,4 +1,6 @@
 from __future__ import annotations
+import hashlib
+import hmac
 import secrets
 import struct
 import time
@@ -70,7 +72,7 @@ def verify_handshake(peer_ed_pub: bytes, hs: bytes, max_age: float=HANDSHAKE_MAX
     return eph_pub
 
 def _state_integrity_tag(root_key: bytes, blob: bytes) -> bytes:
-    return HKDF(algorithm=hashes.SHA256(), length=16, salt=None, info=MAGIC_STATE + b'state-integrity').derive(root_key)
+    return hmac.new(root_key, MAGIC_STATE + blob, hashlib.sha256).digest()[:16]
 
 class RatchetSession:
 
