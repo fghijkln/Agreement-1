@@ -215,7 +215,7 @@ def main(argv=None):
         from . import fskey, replay
         ident = fskey.Identity.load(args.my_id)
         pub_text = open(args.from_pub).read().strip()
-        _verify_from_pub(args, pub_text)
+        commit_pin = _verify_from_pub(args, pub_text)
         from_x, from_ed = fskey.Identity.parse_public(pub_text)
         env = open(args.infile, 'rb').read()
         cache = replay.ReplayCache()
@@ -225,6 +225,7 @@ def main(argv=None):
             sys.exit(f'unseal failed: {e}')
         except Exception as e:
             sys.exit(f'unseal failed (wrong key or tampered): {e}')
+        commit_pin()
         with open(args.outfile, 'wb') as f:
             f.write(plain)
         print(f'unsealed -> {args.outfile} ({len(plain)} bytes, signature+replay verified)')
@@ -258,7 +259,7 @@ def main(argv=None):
         from . import pq, replay
         ident = pq.PQIdentity.load(args.my_id)
         pub_text = open(args.from_pub).read().strip()
-        _verify_from_pub(args, pub_text)
+        commit_pin = _verify_from_pub(args, pub_text)
         snd = pq.PQIdentity.parse_public(pub_text)
         env = open(args.infile, 'rb').read()
         cache = replay.ReplayCache()
@@ -268,6 +269,7 @@ def main(argv=None):
             sys.exit(f'pq-unseal failed: {e}')
         except Exception as e:
             sys.exit(f'pq-unseal failed: {e}')
+        commit_pin()
         with open(args.outfile, 'wb') as f:
             f.write(plain)
         print(f'pq-unsealed -> {args.outfile} ({len(plain)}B, signature+replay verified)')
@@ -293,21 +295,32 @@ def main(argv=None):
         run_chat(ident, args.to_pub, args.relay, speaks_first=False, poll=args.poll)
 
 def _verify_from_pub(args, pub_text: str):
+    """解密前的发送方公钥校验（只读）。返回一个回调，调用方须在解密+验签成功后
+    调用它才会写入/升级 TOFU pin（审计：pin 不得在验证前落盘）。"""
     from . import pins
     try:
         fp = pins.pubkey_fingerprint(pub_text)
     except Exception:
         sys.exit(f'invalid --from-pub public key material: {args.from_pub}')
     if getattr(args, 'from_fp', None):
-        if pins._normalize_fp(args.from_fp) != fp:
+        if not pins.fp_matches(args.from_fp, fp):
             sys.exit(f'fingerprint mismatch: --from-fp={args.from_fp} but {args.from_pub} fingerprint is {fp}')
-        return
+        if pins.is_legacy_fp(args.from_fp):
+            print(f'[nbx] 警告：--from-fp 为旧 64 位指纹，建议改用 128 位指纹 {fp}', file=sys.stderr)
+        return lambda: None
     name = getattr(args, 'from_name', None) or os.path.abspath(args.from_pub)
     try:
         store = pins.PinStore(getattr(args, 'pins', None))
-        store.trust(name, fp)
+        store.check(name, fp)
     except ValueError as e:
         sys.exit(f'--from-pub trust check failed: {e}')
+
+    def _commit():
+        try:
+            store.commit(name, fp)
+        except (ValueError, OSError) as e:
+            sys.exit(f'--from-pub trust check failed: {e}')
+    return _commit
 
 def _safe_name(name) -> str:
     base = os.path.basename(str(name).replace('\\', '/'))
