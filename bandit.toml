@@ -1,4 +1,6 @@
 # Bandit 豁免清单(文档)。
+# CI 门禁: .github/workflows/bandit.yml 的 "Bandit gate" 步骤对 medium/high
+#   严重度(且 medium/high 置信度)发现直接失败(已去掉 `|| true`)。
 # 生效位置: .github/workflows/bandit.yml 里的 --skip / --exclude 参数。
 # 规则: 每个豁免必须带理由; 每次安全审计复审本文件; 新增豁免 = 新增审计义务。
 
@@ -12,7 +14,8 @@
 # B110 try/except/pass —— viewer.py 图片头 best-effort 探测、app UI
 #   轮询, 失败即降级显示, 无安全语义。
 # B112 try/except/continue —— contacts.py 多 endpoint 轮询, 单点失败
-#   跳过即语义。
+#   跳过即语义; daemon.py _migrate_at_rest 遇到无法解析的旧明文会话文件
+#   时原样保留(不迁移), 由 load_session 在真正加载时报错。
 # B310 urlopen scheme —— 已真修: chat.py _urlopen_retry 增加
 #   https/http scheme 白名单, 非 HTTP(S) 直接 raise。豁免仅为消除
 #   已修复项的重复告警。

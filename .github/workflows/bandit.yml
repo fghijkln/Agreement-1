@@ -27,9 +27,15 @@ jobs:
           python-version: '3.11'
       - name: Install bandit
         run: pip install bandit bandit-sarif-formatter
-      - name: Run bandit (SARIF)
+      # 1) 生成 SARIF 报告（--exit-zero 只用于报告生成这一步，供 Code Scanning 展示全部发现）
+      - name: Run bandit (SARIF report)
         run: |
-          bandit -r nbx app tools --skip B101,B103,B104,B108,B110,B112,B310,B404,B603,B607 --exclude nbx/vendor,.venv,tests -f sarif -o bandit.sarif || true
+          bandit -r nbx app tools --skip B101,B103,B104,B108,B110,B112,B310,B404,B603,B607 --exclude nbx/vendor,.venv,tests -f sarif -o bandit.sarif --exit-zero
+      # 2) 门禁：中/高危（且中/高置信度）发现直接让 CI 失败；不再 `|| true`。
+      #    误报请在代码行加 `# nosec BXXX  <理由>`，或在 bandit.toml 登记豁免并更新 --skip。
+      - name: Bandit gate (fail on medium/high severity)
+        run: |
+          bandit -r nbx app tools --skip B101,B103,B104,B108,B110,B112,B310,B404,B603,B607 --exclude nbx/vendor,.venv,tests --severity-level medium --confidence-level medium -f txt
       - name: Upload SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
