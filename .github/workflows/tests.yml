@@ -1,11 +1,12 @@
-# pytest 全量回归: 每次 push/PR 跑测试, 守住"宣称通过前必须真跑"的纪律
+# pytest 全量回归 + Workers relay vitest: 每次 push/PR 跑测试, 守住"宣称通过前必须真跑"的纪律
 name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,13 +14,38 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install deps
         run: |
-          pip install pytest cryptography
+          pip install pytest 'cryptography>=42'
       - name: Run pytest
-        run: PYTHONPATH=. python -m pytest -q
+        run: PYTHONPATH=. python -m pytest -q -ra
+
+  workers-relay:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers-relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: workers-relay/pnpm-lock.yaml
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Run tests
+        run: pnpm test
