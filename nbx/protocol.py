@@ -4,6 +4,7 @@ MAGIC = b'NX'
 HEADER = struct.Struct('<2sBI')
 T_HELLO, T_FILE, T_ACK, T_BYE = (1, 2, 3, 4)
 T_BEGIN, T_CHUNK, T_END = (5, 6, 7)
+T_AUTH = 8
 PROTO_NAME = b'NBXPROTO\x01'
 DEFAULT_CHUNK = 64 * 1024
 
