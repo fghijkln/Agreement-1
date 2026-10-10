@@ -1,7 +1,7 @@
 import os, shutil, subprocess, textwrap, sys
 REPO = os.environ.get('NBX_REPO', os.getcwd())
-BUILD = '/tmp/debbuild/nbx_0.1.0'
-DEB_OUT = '/home/agentuser/nebula-protocol/dist/nbx_0.1.0_all.deb'
+BUILD = '/tmp/debbuild/nbx_0.2.0'
+DEB_OUT = '/home/agentuser/nebula-protocol/dist/nbx_0.2.0_all.deb'
 shutil.rmtree('/tmp/debbuild', ignore_errors=True)
 pkg = BUILD
 dirs = [f'{pkg}/DEBIAN', f'{pkg}/usr/bin', f'{pkg}/usr/lib/nbx', f'{pkg}/usr/share/doc/nbx', f'{pkg}/lib/systemd/system', f'{pkg}/etc/nbx']
@@ -21,7 +21,7 @@ open(f'{pkg}/lib/systemd/system/nbx-daemon@.service', 'w').write(textwrap.dedent
 open(f'{pkg}/etc/nbx/relay', 'w').write('https://sgstfsr4575dfse.redhdyd545.kdns.fr\n')
 readme = f'NBX Messenger (deb) — 端到端加密即时通讯\n协议与代码: https://github.com/fghijkln/Agreement-1\n\n组件:\n  /usr/bin/nbx          CLI (seal/unseal/relay/identity/...)\n  /usr/bin/nbx-relayd   中继服务器 (默认 :8765)\n  /usr/bin/nbx-daemon   常驻会话引擎 (IPC: ~/.local/state/nbx/daemon.sock 或 /var/lib/nbx)\n  /lib/systemd/system/nbx-daemon@.service\n\n用法:\n  sudo systemctl enable --now nbx-daemon@$USER\n  # 状态目录: /var/lib/nbx (含 identity.key, sessions/, messages/)\n'
 open(f'{pkg}/usr/share/doc/nbx/README.txt', 'w').write(readme)
-open(f'{pkg}/DEBIAN/control', 'w').write(textwrap.dedent('    Package: nbx\n    Version: 0.1.0\n    Section: net\n    Priority: optional\n    Architecture: all\n    Depends: python3 (>= 3.10), python3-cryptography\n    Maintainer: fghijkln <fghijkln@users.noreply.github.com>\n    Description: NBX end-to-end encrypted messenger (CLI, relay, daemon)\n     Nebula Transfer Protocol endpoint suite: .nbx container CLI,\n     relay server, resident messaging daemon with double-ratchet\n     sessions. Relay never sees plaintext; keys never leave the device.\n'))
+open(f'{pkg}/DEBIAN/control', 'w').write(textwrap.dedent('    Package: nbx\n    Version: 0.2.0\n    Section: net\n    Priority: optional\n    Architecture: all\n    Depends: python3 (>= 3.10), python3-cryptography\n    Maintainer: fghijkln <fghijkln@users.noreply.github.com>\n    Description: NBX end-to-end encrypted messenger (CLI, relay, daemon)\n     Nebula Transfer Protocol endpoint suite: .nbx container CLI,\n     relay server, resident messaging daemon with double-ratchet\n     sessions. Relay never sees plaintext; keys never leave the device.\n'))
 open(f'{pkg}/DEBIAN/conffiles', 'w').write('/etc/nbx/relay\n')
 os.makedirs('/home/agentuser/nebula-protocol/dist', exist_ok=True)
 subprocess.run(['dpkg-deb', '--build', '--root-owner-group', pkg, DEB_OUT], check=True)
