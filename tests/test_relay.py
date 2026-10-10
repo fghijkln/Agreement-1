@@ -179,9 +179,12 @@ def test_http_server_live(tmp_path):
         opener.open(urllib.request.Request('http://127.0.0.1:18765/envelope', data=b'garbage', method='POST'), timeout=5)
         raise AssertionError('garbage accepted')
     except urllib.error.HTTPError as e:
-        assert e.code == 400
-    resp = opener.open('http://127.0.0.1:18765/health', timeout=5)
-    assert resp.status == 200 and json.loads(resp.read())['ok']
+        with e:
+            assert e.code == 400
+    with opener.open('http://127.0.0.1:18765/health', timeout=5) as resp:
+        assert resp.status == 200 and json.loads(resp.read())['ok']
+    t.join(timeout=5)
+    srv.close()
     print('✓ 真实 HTTP 服务：/envelope 400, /health 200')
 
 def test_e2e_via_relay(tmp_path):

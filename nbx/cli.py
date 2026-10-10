@@ -205,8 +205,8 @@ def main(argv=None):
     elif args.cmd == 'seal':
         from . import fskey
         ident = fskey.Identity.load(args.my_id)
-        to_x, to_ed = fskey.Identity.parse_public(open(args.to_pub).read().strip())
-        data = open(args.infile, 'rb').read()
+        to_x, to_ed = fskey.Identity.parse_public(_read_text(args.to_pub).strip())
+        data = _read_bytes(args.infile)
         env = fskey.seal_envelope(data, ident, to_x, to_ed)
         with open(args.outfile, 'wb') as f:
             f.write(env)
@@ -214,10 +214,10 @@ def main(argv=None):
     elif args.cmd == 'unseal':
         from . import fskey, replay
         ident = fskey.Identity.load(args.my_id)
-        pub_text = open(args.from_pub).read().strip()
+        pub_text = _read_text(args.from_pub).strip()
         commit_pin = _verify_from_pub(args, pub_text)
         from_x, from_ed = fskey.Identity.parse_public(pub_text)
-        env = open(args.infile, 'rb').read()
+        env = _read_bytes(args.infile)
         cache = replay.ReplayCache()
         try:
             plain = fskey.open_envelope(env, ident, from_x, from_ed, cache=cache)
@@ -232,7 +232,7 @@ def main(argv=None):
     elif args.cmd == 'anon':
         from . import anon
         master = _read_key(args.keyfile)
-        data = open(args.infile, 'rb').read()
+        data = _read_bytes(args.infile)
         if args.action == 'pack':
             blob = anon.wrap(data, master, pad_block=args.pad)
             with open(args.outfile, 'wb') as f:
@@ -249,8 +249,8 @@ def main(argv=None):
     elif args.cmd == 'pqseal':
         from . import pq
         ident = pq.PQIdentity.load(args.my_id)
-        rec = pq.PQIdentity.parse_public(open(args.to_pub).read().strip())
-        data = open(args.infile, 'rb').read()
+        rec = pq.PQIdentity.parse_public(_read_text(args.to_pub).strip())
+        data = _read_bytes(args.infile)
         env = pq.seal_pq(data, ident, *rec)
         with open(args.outfile, 'wb') as f:
             f.write(env)
@@ -258,10 +258,10 @@ def main(argv=None):
     elif args.cmd == 'pqunseal':
         from . import pq, replay
         ident = pq.PQIdentity.load(args.my_id)
-        pub_text = open(args.from_pub).read().strip()
+        pub_text = _read_text(args.from_pub).strip()
         commit_pin = _verify_from_pub(args, pub_text)
         snd = pq.PQIdentity.parse_public(pub_text)
-        env = open(args.infile, 'rb').read()
+        env = _read_bytes(args.infile)
         cache = replay.ReplayCache()
         try:
             plain = pq.open_pq(env, ident, snd[0], snd[1], cache=cache)
@@ -321,6 +321,14 @@ def _verify_from_pub(args, pub_text: str):
         except (ValueError, OSError) as e:
             sys.exit(f'--from-pub trust check failed: {e}')
     return _commit
+
+def _read_text(path: str) -> str:
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, 'rb') as f:
+        return f.read()
 
 def _safe_name(name) -> str:
     base = os.path.basename(str(name).replace('\\', '/'))

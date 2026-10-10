@@ -58,3 +58,5 @@ def test_network_transfer(tmp_path):
     finally:
         server.terminate()
         server.wait(timeout=5)
+        if server.stdout is not None:
+            server.stdout.close()

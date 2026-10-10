@@ -282,3 +282,6 @@ class RelayServer:
 
     def serve_until_stop(self):
         self._httpd.handle_request()
+
+    def close(self):
+        self._httpd.server_close()

@@ -245,12 +245,14 @@ def test_contactbook_encrypted_session_and_legacy_migration(tmp_path):
     c = legacy.add(fskey.Identity.generate().export_public())
     c.session_state = state
     legacy.save()
-    assert state in open(path).read()
+    with open(path) as fh:
+        assert state in fh.read()
     # 用密钥打开：可读旧明文，save 后迁移
     book = ContactBook(path, storage_key=key)
     assert book.load_session(c.fp) is not None
     book.save()
-    on_disk = open(path).read()
+    with open(path) as fh:
+        on_disk = fh.read()
     assert state not in on_disk and 'session_enc' in on_disk
     assert _mode(path) == 0o600
     book2 = ContactBook(path, storage_key=key)
