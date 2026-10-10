@@ -114,9 +114,9 @@ def send_file(path: str, host: str, port: int, keyfile: str | None=None) -> str:
     elif len(data) > 108 and data[:8] not in (b'NBXFILE\x02',):
         pass
     if not e2e:
-        meta = {'type': 'binary', 'mime': 'application/octet-stream', 'filename': os.path.basename(path), 'enc': 'chacha20poly1305', 'auto': True}
-        inner = crypto.encrypt(data, master)
-        data = carrier.pack([(carrier.TLV_BIN, inner)], meta, flags=carrier.FLAG_ENCRYPTED)
+        meta = {'type': 'binary', 'mime': 'application/octet-stream', 'filename': os.path.basename(path), 'size': len(data)}
+        # 元数据(文件名/类型/parts)经 AEAD associated data 认证（审计 T4）
+        data = carrier.encrypt_carrier(carrier.pack([(carrier.TLV_BIN, data)], meta), master)
         name = os.path.basename(path) + '.nbx'
         print(f'[nbx] plaintext detected -> auto-encrypted for transfer ({len(data)}B)')
     else:

@@ -132,10 +132,7 @@ def main(argv=None):
             blob = carrier.pack(streams, meta, flags=flags, compress=True)
         if args.encrypt:
             master = _read_key(args.keyfile)
-            meta, streams, flags = carrier.unpack(blob)
-            enc = crypto.encrypt(carrier._build_payload(streams), master)
-            meta['enc'] = 'chacha20poly1305'
-            blob = carrier.pack([(carrier.TLV_BIN, enc)], meta, flags=carrier.FLAG_ENCRYPTED)
+            blob = carrier.encrypt_carrier(blob, master)
         with open(args.outfile, 'wb') as f:
             f.write(blob)
         print(f'converted {args.infile} -> {args.outfile} ({len(blob)} bytes)')
@@ -146,25 +143,24 @@ def main(argv=None):
         meta, streams, flags = carrier.unpack(blob)
         if flags & carrier.FLAG_ENCRYPTED:
             master = _read_key(args.keyfile)
-            payload = crypto.decrypt(streams[0][1], master)
-            p, inner = (0, [])
-            while p < len(payload):
-                stype, slen = carrier.TLV.unpack_from(payload, p)
-                p += carrier.TLV.size
-                inner.append((stype, payload[p:p + slen]))
-                p += slen
-            streams = inner
+            try:
+                streams = carrier.decrypt_streams(meta, flags, streams, master)
+            except Exception:
+                sys.exit('extract failed: wrong key or tampered container (metadata/payload authentication failed)')
         import os
         os.makedirs(args.outdir, exist_ok=True)
         ctype = meta.get('type')
-        if ctype == 'bundle' and 'parts' in meta:
-            for part, (stype, content) in zip(meta['parts'], streams):
-                out = os.path.join(args.outdir, part.get('name', 'part'))
+        if ctype == 'bundle':
+            parts = meta.get('parts')
+            if not isinstance(parts, list) or len(parts) != len(streams):
+                sys.exit('extract failed: bundle parts metadata does not match streams')
+            for part, (stype, content) in zip(parts, streams):
+                out = os.path.join(args.outdir, _safe_name(part.get('name', 'part')))
                 with open(out, 'wb') as f:
                     f.write(content)
                 print(f'extracted -> {out} ({len(content)} bytes)')
         else:
-            name = meta.get('filename', 'untitled')
+            name = _safe_name(meta.get('filename', 'untitled'))
             out = os.path.join(args.outdir, name)
             with open(out, 'wb') as f:
                 f.write(streams[0][1])
@@ -312,6 +308,12 @@ def _verify_from_pub(args, pub_text: str):
         store.trust(name, fp)
     except ValueError as e:
         sys.exit(f'--from-pub trust check failed: {e}')
+
+def _safe_name(name) -> str:
+    base = os.path.basename(str(name).replace('\\', '/'))
+    if base in ('', '.', '..'):
+        sys.exit('extract failed: unsafe file name in container metadata')
+    return base
 
 def _read_key(path: str) -> bytes:
     try:

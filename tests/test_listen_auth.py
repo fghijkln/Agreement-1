@@ -58,7 +58,8 @@ def _decrypt_payload(blob: bytes, master: bytes) -> bytes:
     from nbx import carrier, crypto
     meta, streams, flags = carrier.unpack(blob)
     assert flags & carrier.FLAG_ENCRYPTED, '明文应被主密钥自动加密'
-    return crypto.decrypt(streams[0][1], master)
+    # 自动加密现为标准加密载体（元数据经 AEAD AAD 认证），用 carrier API 解
+    return carrier.decrypt_streams(meta, flags, streams, master)[0][1]
 
 def test_normal_roundtrip_encrypted_and_verified(tmp_path):
     port = _free_port()

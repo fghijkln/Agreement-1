@@ -73,10 +73,92 @@ def unpack(blob: bytes) -> tuple[dict, list[tuple[int, bytes]], int]:
             raise NBXError('truncated stream')
         streams.append((stype, payload[p:p + slen]))
         p += slen
+    raw_lens = [len(c) for _, c in streams]
     if flags & FLAG_COMPRESSED:
         import lzma
         streams = [(stype, lzma.decompress(c)) for stype, c in streams]
+    if not isinstance(meta, dict):
+        raise NBXError('metadata must be a JSON object')
+    if not flags & FLAG_ENCRYPTED:
+        _check_meta_consistency(meta, streams, raw_lens)
     return (meta, streams, flags)
+
+
+TEXT_TYPES = ('text', 'html', 'markdown')
+META_AAD_MARKER = 'meta-v1'
+META_AAD_LABEL = b'nbx-carrier-meta-v1'
+
+
+def _check_meta_consistency(meta: dict, streams: list[tuple[int, bytes]], raw_lens: list[int] | None=None) -> None:
+    """审计 T4：元数据与实际流必须一致，否则拒绝（防部分数/长度/类型伪造导致静默丢流）。"""
+    parts = meta.get('parts')
+    if parts is not None:
+        if not isinstance(parts, list) or not all((isinstance(p, dict) for p in parts)):
+            raise NBXError('metadata parts malformed')
+        if len(parts) != len(streams):
+            raise NBXError(f'metadata parts count {len(parts)} != stream count {len(streams)}')
+        for i, (part, (stype, content)) in enumerate(zip(parts, streams)):
+            want = part.get('len')
+            if want is not None:
+                ok = {len(content)}
+                if raw_lens is not None:
+                    ok.add(raw_lens[i])
+                if want not in ok:
+                    raise NBXError(f'metadata part {i} length mismatch')
+            ptype = part.get('type')
+            if ptype in TEXT_TYPES and stype != TLV_TEXT:
+                raise NBXError(f'metadata part {i} claims {ptype} but stream is binary')
+    if meta.get('type') in TEXT_TYPES and any((stype != TLV_TEXT for stype, _ in streams)):
+        raise NBXError(f"metadata type {meta.get('type')!r} does not match binary stream")
+    if meta.get('type') == 'bundle' and parts is None:
+        raise NBXError('bundle without parts metadata')
+
+
+def _meta_aad(meta: dict, flags: int) -> bytes:
+    canon = json.dumps(meta, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return META_AAD_LABEL + bytes([flags & 255]) + canon
+
+
+def encrypt_carrier(blob: bytes, master_key: bytes) -> bytes:
+    """把明文载体整体加密：payload 进 AEAD，元数据(含 flags)作为 associated data 认证。"""
+    from . import crypto
+    meta, streams, _ = unpack(blob)
+    meta = dict(meta)
+    meta.setdefault('parts', [{'type': s, 'len': len(c)} for s, c in streams])
+    meta['enc'] = 'chacha20poly1305'
+    meta['aad'] = META_AAD_MARKER
+    flags = FLAG_ENCRYPTED
+    enc = crypto.encrypt(_build_payload(streams), master_key, aad=_meta_aad(meta, flags))
+    return pack([(TLV_BIN, enc)], meta, flags=flags)
+
+
+def decrypt_streams(meta: dict, flags: int, streams: list[tuple[int, bytes]], master_key: bytes) -> list[tuple[int, bytes]]:
+    """解密加密载体并解析内部 TLV。新格式(meta['aad']=='meta-v1')校验元数据；
+    旧格式（无 aad 标记）兼容解密但元数据未认证。剥掉 aad 标记降级会因 AEAD 失败被拒。"""
+    from . import crypto
+    if not flags & FLAG_ENCRYPTED:
+        return streams
+    if len(streams) != 1:
+        raise NBXError('encrypted carrier must have exactly one stream')
+    aad = _meta_aad(meta, flags) if meta.get('aad') == META_AAD_MARKER else None
+    payload = crypto.decrypt(streams[0][1], master_key, aad=aad)
+    if aad is None and meta.get('auto'):
+        # 旧版 transfer 自动加密：payload 为原始文件字节而非 TLV
+        return [(TLV_BIN, payload)]
+    inner = []
+    p = 0
+    while p < len(payload):
+        if p + TLV.size > len(payload):
+            raise NBXError('truncated TLV header')
+        stype, slen = TLV.unpack_from(payload, p)
+        p += TLV.size
+        if p + slen > len(payload):
+            raise NBXError('truncated stream')
+        inner.append((stype, payload[p:p + slen]))
+        p += slen
+    if aad is not None:
+        _check_meta_consistency(meta, inner)
+    return inner
 MAGIC_SNIFF = [(b'\x89PNG\r\n\x1a\n', 'image/png'), (b'\xff\xd8\xff', 'image/jpeg'), (b'GIF8', 'image/gif'), (b'BM', 'image/bmp'), (b'%PDF', 'application/pdf'), (b'PK\x03\x04', 'application/zip'), (b'\x1f\x8b', 'application/gzip'), (b'ID3', 'audio/mpeg'), (b'OggS', 'audio/ogg'), (b'RIFF', 'application/octet-stream'), (b'\x00\x00\x00\x18ftyp', 'video/mp4'), (b'\x1aE\xdf\xa3', 'video/webm'), (b"7z\xbc\xaf'\x1c", 'application/x-7z-compressed'), (b'Rar!', 'application/vnd.rar')]
 
 def sniff_mime(data: bytes, name: str='') -> tuple[str, str]:
@@ -127,11 +209,11 @@ def extract(blob: bytes) -> list[tuple[str, bytes]]:
     meta, streams, _ = unpack(blob)
     ctype = meta.get('type', 'binary')
     filename = meta.get('filename', 'untitled')
-    if ctype == 'bundle' and 'parts' in meta:
-        out = []
-        for part, (stype, content) in zip(meta['parts'], streams):
-            out.append((part.get('name', 'part'), content))
-        return out
-    if ctype == 'binary':
-        return [(filename, streams[0][1])]
+    if ctype == 'bundle':
+        parts = meta.get('parts')
+        if not isinstance(parts, list) or len(parts) != len(streams):
+            raise NBXError('bundle parts metadata does not match streams')
+        return [(part.get('name', 'part'), content) for part, (stype, content) in zip(parts, streams)]
+    if not streams:
+        raise NBXError('container has no streams')
     return [(filename, streams[0][1])]

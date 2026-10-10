@@ -15,16 +15,16 @@ def derive_subkey(master_key: bytes, file_salt: bytes) -> bytes:
     hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=file_salt, info=KEY_INFO)
     return hkdf.derive(master_key)
 
-def encrypt(data: bytes, master_key: bytes) -> bytes:
+def encrypt(data: bytes, master_key: bytes, aad: bytes | None=None) -> bytes:
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(NONCE_SIZE)
     key = derive_subkey(master_key, salt)
-    ct = ChaCha20Poly1305(key).encrypt(nonce, data, None)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, data, aad)
     return salt + nonce + ct
 
-def decrypt(blob: bytes, master_key: bytes) -> bytes:
+def decrypt(blob: bytes, master_key: bytes, aad: bytes | None=None) -> bytes:
     if len(blob) < 16 + NONCE_SIZE + 16:
         raise ValueError('ciphertext too short')
     salt, nonce, ct = (blob[:16], blob[16:16 + NONCE_SIZE], blob[16 + NONCE_SIZE:])
     key = derive_subkey(master_key, salt)
-    return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, aad)

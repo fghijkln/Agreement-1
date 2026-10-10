@@ -66,15 +66,7 @@ def view(blob: bytes, master_key: bytes | None=None, image_preview: bool=False) 
             v.add('🔒 此容器已加密。提供密钥以查看内容 (--keyfile)。')
             return v.text()
         try:
-            from . import crypto
-            payload = crypto.decrypt(streams[0][1], master_key)
-            p, inner = (0, [])
-            while p < len(payload):
-                stype, slen = carrier.TLV.unpack_from(payload, p)
-                p += carrier.TLV.size
-                inner.append((stype, payload[p:p + slen]))
-                p += slen
-            streams = inner
+            streams = carrier.decrypt_streams(meta, flags, streams, master_key)
         except Exception:
             v.add('❌ 密钥错误，无法解密内容。')
             return v.text()
