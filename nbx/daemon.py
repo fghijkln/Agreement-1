@@ -114,6 +114,7 @@ class Daemon:
         self.client = RelayClient(relay_url)
         self.contacts: dict[str, ContactSession] = {}
         self._pending_hs: dict[bytes, RatchetSession] = {}
+        self._pending_texts: dict[bytes, list[bytes]] = {}
         self._stop = threading.Event()
         self._lock = threading.Lock()
 
@@ -294,7 +295,6 @@ class Daemon:
                 return
             self.log_message('in', peer_fp, text)
             self._on_message(cs, text)
-    _pending_texts: dict[bytes, list[bytes]] = {}
 
     def _on_message(self, cs: ContactSession, text: str) -> None:
         pass
