@@ -64,13 +64,14 @@ def send_file(path: str, host: str, port: int, keyfile: str | None=None) -> str:
     speed = total / dt / 1024 if dt > 0 else 0
     return f'sent {name} ({total} bytes, {len(chunks)} chunks) in {dt:.2f}s ({speed:.0f} KB/s)'
 
-def listen(port: int, outdir: str, keyfile: str | None=None) -> None:
+def listen(port: int, outdir: str, keyfile: str | None=None,
+           host: str='127.0.0.1') -> None:
     os.makedirs(outdir, exist_ok=True)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', port))
+    srv.bind((host, port))
     srv.listen(1)
-    print(f'[nbx] listening on 0.0.0.0:{port}')
+    print(f'[nbx] listening on {host}:{port}')
     while True:
         conn, addr = srv.accept()
         try:

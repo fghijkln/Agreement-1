@@ -122,9 +122,11 @@ def main(argv=None) -> int:
     ap.add_argument('--port', type=int, default=0, help='绑定本地端口（默认随机）')
     ap.add_argument('--seconds', type=float, default=25.0, help='打洞持续秒数')
     ap.add_argument('--no-stun', action='store_true', help='跳过 STUN 探测')
+    ap.add_argument('--host', default='0.0.0.0',
+                    help='UDP 绑定地址（打洞收公网包必须 0.0.0.0，勿改）')
     args = ap.parse_args(argv)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('0.0.0.0', args.port))
+    sock.bind((args.host, args.port))
     local = sock.getsockname()
     print(f'本地 UDP 端口: {local[1]}')
     if not args.no_stun:

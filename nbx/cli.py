@@ -29,6 +29,8 @@ def main(argv=None):
     l.add_argument('port', type=int)
     l.add_argument('--outdir', default='received')
     l.add_argument('--keyfile', default='nbx.key')
+    l.add_argument('--host', default='127.0.0.1',
+                   help='监听地址（默认仅本机；局域网接收用 --host 0.0.0.0）')
     cv = sub.add_parser('convert', help='把任意文件转成 .nbx 通用载体')
     cv.add_argument('infile')
     cv.add_argument('outfile')
@@ -258,7 +260,7 @@ def main(argv=None):
     elif args.cmd == 'send':
         print(transfer.send_file(args.file, args.host, args.port, args.keyfile))
     elif args.cmd == 'listen':
-        transfer.listen(args.port, args.outdir, args.keyfile)
+        transfer.listen(args.port, args.outdir, args.keyfile, args.host)
     elif args.cmd == 'relay':
         from .relay import RelayLogic, MemoryStore, RelayServer
         from .relay import load_or_create_relay_key
