@@ -97,7 +97,7 @@ def main(argv=None):
         with open(args.infile, 'rb') as f:
             data = f.read()
         meta = json.loads(args.meta)
-        meta['enc'] = 'chacha20p1305'
+        meta['enc'] = 'chacha20poly1305'
         blob = format.pack(crypto.encrypt(data, master), meta)
         with open(args.outfile, 'wb') as f:
             f.write(blob)
