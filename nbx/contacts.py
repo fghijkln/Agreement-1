@@ -138,11 +138,13 @@ class TransportResult:
 
 class TransportStack:
 
-    def __init__(self, book: ContactBook, my_identity: Identity, socks_proxy: str | None=None, pin_file: str | None=None):
+    def __init__(self, book: ContactBook, my_identity: Identity, socks_proxy: str | None=None, pin_file: str | None=None, socks_timeout: float=10.0, io_deadline: float=30.0):
         self.book = book
         self.me = my_identity
         self.my_fp = fp_of_pub(my_identity.export_public())
         self.socks_proxy = socks_proxy
+        self.socks_timeout = socks_timeout
+        self.io_deadline = io_deadline
         self._relay_authed: set[bytes] = set()
         self._verified_endpoints: set[str] = set()
         self._relay_pins: dict[str, bytes] = {}
@@ -158,18 +160,44 @@ class TransportStack:
             except Exception:
                 pass
 
+    @staticmethod
+    def _recv_all(s: socket.socket, deadline: float, limit: int) -> bytes:
+        buf = b''
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('recv deadline exceeded')
+            try:
+                s.settimeout(remaining)
+            except OSError:
+                pass
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > limit:
+                break
+        return buf
+
+    @staticmethod
+    def _recv_exact(s: socket.socket, n: int) -> bytes:
+        buf = b''
+        while len(buf) < n:
+            chunk = s.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError('SOCKS5 handshake: connection closed before full reply')
+            buf += chunk
+        return buf
+
     def _http_post(self, url: str, data: bytes, proxy: str | None, timeout: float=8.0) -> tuple[int, bytes]:
         if proxy:
             s = self._socks_connect(*self._split_addr(url))
-            http = f'POST {url} HTTP/1.0\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data
-            s.sendall(http)
-            resp = b''
-            while True:
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                resp += chunk
-            s.close()
+            try:
+                http = f'POST {url} HTTP/1.0\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data
+                s.sendall(http)
+                resp = self._recv_all(s, time.monotonic() + self.io_deadline, 8 * 1024 * 1024)
+            finally:
+                s.close()
             status = int(resp.split(b' ')[1]) if resp else 0
             return (status, resp.split(b'\r\n\r\n', 1)[1] if b'\r\n\r\n' in resp else b'')
         handler = urllib.request.ProxyHandler({})
@@ -278,41 +306,56 @@ class TransportStack:
     def _send_via_anon(self, c: Contact, onion_addr: str, blob: bytes) -> TransportResult:
         if not self.socks_proxy:
             return TransportResult(LAYER_ANON, False, 'no socks proxy configured')
+        s = None
         try:
             host, port = onion_addr.replace('http://', '').rsplit(':', 1)
             s = self._socks_connect(host, int(port))
             data = blob + self._delivery_proof(blob)
             http = f'POST /envelope HTTP/1.0\r\nHost: {onion_addr}\r\nContent-Length: {len(data)}\r\n\r\n'.encode() + data
             s.sendall(http)
-            resp = b''
-            while True:
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                resp += chunk
-                if len(resp) > 65536:
-                    break
-            s.close()
+            resp = self._recv_all(s, time.monotonic() + self.io_deadline, 65536)
             ok = b' 202 ' in resp.split(b'\r\n')[0] if resp else False
             return TransportResult(LAYER_ANON, ok, resp.split(b'\r\n')[0].decode(errors='replace'))
         except Exception as e:
             return TransportResult(LAYER_ANON, False, str(e))
+        finally:
+            if s is not None:
+                s.close()
 
     def _socks_connect(self, host: str, port: int) -> socket.socket:
         if not self.socks_proxy:
             raise RuntimeError('no socks proxy')
         phost, pport = self.socks_proxy.rsplit(':', 1)
-        s = socket.create_connection((phost, int(pport)), timeout=10)
-        s.sendall(b'\x05\x01\x00')
-        if s.recv(2) != b'\x05\x00':
-            s.close()
-            raise OSError('SOCKS5 handshake rejected')
-        s.sendall(b'\x05\x01\x00\x03' + bytes([len(host)]) + host.encode() + struct.pack('>H', port))
-        resp = s.recv(10)
-        if resp[1] != 0:
-            s.close()
-            raise ConnectionError(f'SOCKS5 connect failed: {resp[1]}')
-        return s
+        s = socket.create_connection((phost, int(pport)), timeout=self.socks_timeout)
+        try:
+            s.settimeout(self.socks_timeout)
+            s.sendall(b'\x05\x01\x00')
+            if self._recv_exact(s, 2) != b'\x05\x00':
+                raise OSError('SOCKS5 handshake rejected')
+            s.sendall(b'\x05\x01\x00\x03' + bytes([len(host)]) + host.encode() + struct.pack('>H', port))
+            resp = self._recv_exact(s, 4)
+            if resp[0] != 5:
+                raise ConnectionError('SOCKS5 connect: bad reply version')
+            if resp[1] != 0:
+                raise ConnectionError(f'SOCKS5 connect failed: {resp[1]}')
+            # 按 ATYP 读完 BND.ADDR + BND.PORT，避免残留字节混入后续 HTTP 响应
+            atyp = resp[3]
+            if atyp == 1:
+                self._recv_exact(s, 4 + 2)
+            elif atyp == 4:
+                self._recv_exact(s, 16 + 2)
+            elif atyp == 3:
+                ln = self._recv_exact(s, 1)[0]
+                self._recv_exact(s, ln + 2)
+            else:
+                raise ConnectionError('SOCKS5 connect: bad address type')
+            return s
+        except BaseException:
+            try:
+                s.close()
+            except OSError:
+                pass
+            raise
 
     def _send_via_p2p(self, c: Contact, addr: str, blob: bytes) -> TransportResult:
         try:
@@ -360,6 +403,7 @@ class TransportStack:
                     except Exception:
                         continue
                 elif a.get('last_ok') and a['addr'] in self._verified_endpoints:
+                    s = None
                     try:
                         if a['layer'] == LAYER_ANON:
                             s = self._socks_connect(*self._split_addr(a['addr']))
@@ -369,19 +413,16 @@ class TransportStack:
                         body = proof
                         http = f"POST /inbox/{_b64e(self.my_fp)} HTTP/1.0\r\nHost: {a['addr']}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
                         s.sendall(http)
-                        resp = b''
-                        while True:
-                            chunk = s.recv(65536)
-                            if not chunk:
-                                break
-                            resp += chunk
-                        s.close()
+                        resp = self._recv_all(s, time.monotonic() + self.io_deadline, 8 * 1024 * 1024)
                         if b'\r\n\r\n' in resp:
                             body = resp.split(b'\r\n\r\n', 1)[1]
                             for e in json.loads(body).get('envelopes', []):
                                 results.append((a['layer'], _b64d(e)))
                     except Exception:
                         continue
+                    finally:
+                        if s is not None:
+                            s.close()
         return results
 
     @staticmethod
