@@ -207,7 +207,8 @@ def run_chat(identity: Identity, peer_pub_b64: str, relay_base: str, speaks_firs
                 for ptype, text in me.poll_once():
                     print(f'\r[peer] {text}\n> ', end='', flush=True)
             except Exception as e:
-                print(f'\r[poll error] {e}\n> ', end='', flush=True)
+                from . import errors
+                print(f"\r[{errors.public_message('poll error', e)}]\n> ", end='', flush=True)
             stop.wait(poll)
     t = threading.Thread(target=poller, daemon=True)
     t.start()

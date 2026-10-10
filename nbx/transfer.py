@@ -165,7 +165,8 @@ def listen(port: int, outdir: str, keyfile: str | None=None,
                 try:
                     _serve_transfer(conn, addr, outdir, master)
                 except Exception as e:
-                    print(f'\n[nbx] error from {addr}: {type(e).__name__}: {e}')
+                    from . import errors
+                    print('\n[nbx] ' + errors.public_message('transfer aborted', e))
         except KeyboardInterrupt:
             print('\n[nbx] shutting down')
             break

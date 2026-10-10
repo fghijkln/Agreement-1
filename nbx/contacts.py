@@ -12,6 +12,7 @@ from . import message as msg
 from .fskey import Identity
 from .ratchet import RatchetSession
 from . import storage
+from . import errors
 LAYER_P2P = 1
 LAYER_ANON = 2
 LAYER_RELAY = 3
@@ -233,7 +234,7 @@ class TransportStack:
             status, _ = self._http_post(base + '/envelope', blob + self._delivery_proof(blob), None)
             return TransportResult(LAYER_RELAY, status == 202, f'HTTP {status}')
         except Exception as e:
-            return TransportResult(LAYER_RELAY, False, str(e))
+            return TransportResult(LAYER_RELAY, False, errors.public_message('relay send', e))
 
     def _delivery_proof(self, blob: bytes) -> bytes:
         import hashlib, struct as _s
@@ -317,7 +318,7 @@ class TransportStack:
             ok = b' 202 ' in resp.split(b'\r\n')[0] if resp else False
             return TransportResult(LAYER_ANON, ok, resp.split(b'\r\n')[0].decode(errors='replace'))
         except Exception as e:
-            return TransportResult(LAYER_ANON, False, str(e))
+            return TransportResult(LAYER_ANON, False, errors.public_message('anon send', e))
         finally:
             if s is not None:
                 s.close()
@@ -368,7 +369,7 @@ class TransportStack:
             ok = b' 202 ' in resp.split(b'\r\n')[0] if resp else False
             return TransportResult(LAYER_P2P, ok, resp.split(b'\r\n')[0].decode(errors='replace'))
         except Exception as e:
-            return TransportResult(LAYER_P2P, False, str(e))
+            return TransportResult(LAYER_P2P, False, errors.public_message('p2p send', e))
 
     def send(self, peer_fp: bytes, blob: bytes) -> TransportResult:
         c = self.book.get(peer_fp)

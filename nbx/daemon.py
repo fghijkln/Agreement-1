@@ -11,6 +11,7 @@ from .chat import RelayClient, auth_proof, fingerprint8, _urlopen_retry, deliver
 from .ratchet import RatchetSession, HandshakeStale, handshake_age
 from . import message as msg
 from . import storage
+from . import errors
 DAEMON_MAGIC = b'NBXDAEMON1'
 IPC_VERSION = 1
 
@@ -317,13 +318,16 @@ class Daemon:
         try:
             blobs = self.client.fetch(self.my_fp, auth_proof(self.identity, self.my_fp))
         except Exception as e:
-            self.log_event(f'poll 失败: {type(e).__name__}')
+            self.log_event('poll 失败: ' + errors.classify(e))
+            errors.public_message('poll', e)
             return
         for blob in blobs:
             try:
                 self._handle_envelope(blob)
             except Exception as e:
-                self.log_event(f'信封处理失败: {type(e).__name__}: {e}')
+                # 审计 T4：events.log 只记固定文案+分类，异常原文/堆栈仅 DEBUG
+                self.log_event('信封处理失败: ' + errors.classify(e))
+                errors.public_message('envelope', e)
 
     def _handle_envelope(self, blob: bytes) -> None:
         m = msg.parse_message(blob)
@@ -381,6 +385,12 @@ class Daemon:
             return {'ok': True, 'items': self.history(req['pub'], req.get('limit', 50))}
         return {'ok': False, 'error': f'unknown cmd {cmd}'}
 
+    def _ipc_dispatch(self, data: bytes) -> dict:
+        try:
+            return self.handle_ipc(json.loads(data))
+        except Exception as e:
+            return {'ok': False, 'error': errors.public_message('request failed', e)}
+
     def serve_ipc(self, sock_path: str | None=None) -> None:
         sock_path = sock_path or str(self.state_dir / 'daemon.sock')
         if os.path.exists(sock_path):
@@ -399,11 +409,7 @@ class Daemon:
                 data = conn.recv(65536)
                 if not data:
                     continue
-                try:
-                    req = json.loads(data)
-                    resp = self.handle_ipc(req)
-                except Exception as e:
-                    resp = {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+                resp = self._ipc_dispatch(data)
                 conn.sendall(json.dumps(resp, ensure_ascii=False).encode())
         srv.close()
 

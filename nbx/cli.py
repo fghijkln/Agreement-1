@@ -4,7 +4,7 @@ import base64
 import json
 import os
 import sys
-from . import crypto, format, transfer
+from . import crypto, errors, format, transfer
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog='nbx', description='Nebula Transfer Protocol')
@@ -101,6 +101,7 @@ def main(argv=None):
     ch.add_argument('--to-pub', required=True, help='对方身份公钥（Base64）')
     ch.add_argument('--poll', type=float, default=2.0, help='取信轮询秒数')
     args = p.parse_args(argv)
+    errors.maybe_enable_debug_from_env()
     if args.cmd == 'keygen':
         key = crypto.generate_master_key()
         with open(args.out, 'w', encoding='utf-8') as f:
@@ -145,7 +146,8 @@ def main(argv=None):
             master = _read_key(args.keyfile)
             try:
                 streams = carrier.decrypt_streams(meta, flags, streams, master)
-            except Exception:
+            except Exception as e:
+                errors.public_message('extract', e)
                 sys.exit('extract failed: wrong key or tampered container (metadata/payload authentication failed)')
         import os
         os.makedirs(args.outdir, exist_ok=True)
@@ -221,10 +223,10 @@ def main(argv=None):
         cache = replay.ReplayCache()
         try:
             plain = fskey.open_envelope(env, ident, from_x, from_ed, cache=cache)
-        except ValueError as e:
-            sys.exit(f'unseal failed: {e}')
         except Exception as e:
-            sys.exit(f'unseal failed (wrong key or tampered): {e}')
+            # 审计 T4：不向用户区分“签名错/时间错/重放/密钥错”，细节仅 DEBUG（NBX_DEBUG=1）
+            errors.public_message('unseal', e)
+            sys.exit('unseal failed: wrong key, tampered, replayed or expired envelope')
         commit_pin()
         with open(args.outfile, 'wb') as f:
             f.write(plain)
@@ -242,7 +244,8 @@ def main(argv=None):
             try:
                 inner = anon.unwrap(data, master)
             except Exception as e:
-                sys.exit(f'unwrap failed: {e}')
+                errors.public_message('unwrap', e)
+                sys.exit('unwrap failed: wrong key or tampered data')
             with open(args.outfile, 'wb') as f:
                 f.write(inner)
             print(f'unwrapped -> {args.outfile} ({len(inner)}B)')
@@ -265,10 +268,9 @@ def main(argv=None):
         cache = replay.ReplayCache()
         try:
             plain = pq.open_pq(env, ident, snd[0], snd[1], cache=cache)
-        except ValueError as e:
-            sys.exit(f'pq-unseal failed: {e}')
         except Exception as e:
-            sys.exit(f'pq-unseal failed: {e}')
+            errors.public_message('pq-unseal', e)
+            sys.exit('pq-unseal failed: wrong key, tampered, replayed or expired envelope')
         commit_pin()
         with open(args.outfile, 'wb') as f:
             f.write(plain)
