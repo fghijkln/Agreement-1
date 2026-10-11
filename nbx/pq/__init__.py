@@ -1,11 +1,12 @@
 from __future__ import annotations
 import base64
+import os
 import secrets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from .. import replay
+from .. import replay, storage
 from ..vendor.kyber_py.ml_kem import ML_KEM_768
 NONCE_SIZE = 12
 PQ_INFO = b'nbx-pq-hybrid-session-v1'
@@ -41,11 +42,11 @@ class PQIdentity:
         return cls(x, ed, data[64:64 + 1184], data[64 + 1184:64 + 1184 + 2400])
 
     def save(self, path: str):
-        with open(path, 'wb') as f:
-            f.write(base64.b64encode(self.to_bytes()) + b'\n')
+        storage.atomic_write(path, base64.b64encode(self.to_bytes()) + b'\n', mode=0o600)
 
     @classmethod
     def load(cls, path: str) -> 'PQIdentity':
+        os.chmod(path, 0o600)
         with open(path, 'rb') as f:
             return cls.from_bytes(base64.b64decode(f.read().strip()))
     MAGIC_ENC = b'NBXPQ1'
@@ -59,13 +60,13 @@ class PQIdentity:
         nonce = secrets.token_bytes(12)
         ct = ChaCha20Poly1305(key).encrypt(nonce, self.to_bytes(), None)
         blob = self.MAGIC_ENC + bytes([15, 8, 1]) + salt + nonce + ct
-        with open(path, 'wb') as f:
-            f.write(base64.b64encode(blob) + b'\n')
+        storage.atomic_write(path, base64.b64encode(blob) + b'\n', mode=0o600)
 
     @classmethod
     def load_encrypted(cls, path: str, passphrase: str) -> 'PQIdentity':
         from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        os.chmod(path, 0o600)
         with open(path, 'rb') as f:
             blob = base64.b64decode(f.read().strip())
         if blob[:6] != cls.MAGIC_ENC:

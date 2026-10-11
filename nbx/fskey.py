@@ -1,10 +1,11 @@
 from __future__ import annotations
+import os
 import secrets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from . import replay
+from . import replay, storage
 NONCE_SIZE = 12
 FS_INFO = b'nbx-fs-session-key-v1'
 EPH_PUB_SIZE = 32
@@ -27,12 +28,13 @@ class Identity:
 
     def save(self, path: str):
         import base64
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(base64.b64encode(self.to_bytes()).decode() + '\n')
+        data = (base64.b64encode(self.to_bytes()).decode() + '\n').encode('utf-8')
+        storage.atomic_write(path, data, mode=0o600)
 
     @classmethod
     def load(cls, path: str) -> 'Identity':
         import base64
+        os.chmod(path, 0o600)
         with open(path, 'r', encoding='utf-8') as f:
             return cls.from_bytes(base64.b64decode(f.read().strip()))
     MAGIC_ENC = b'NBXID1'
@@ -47,14 +49,14 @@ class Identity:
         nonce = secrets.token_bytes(12)
         ct = ChaCha20Poly1305(key).encrypt(nonce, self.to_bytes(), None)
         blob = self.MAGIC_ENC + bytes([15, 8, 1]) + salt + nonce + ct
-        with open(path, 'wb') as f:
-            f.write(base64.b64encode(blob) + b'\n')
+        storage.atomic_write(path, base64.b64encode(blob) + b'\n', mode=0o600)
 
     @classmethod
     def load_encrypted(cls, path: str, passphrase: str) -> 'Identity':
         from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
         import base64
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        os.chmod(path, 0o600)
         with open(path, 'rb') as f:
             blob = base64.b64decode(f.read().strip())
         if blob[:6] != cls.MAGIC_ENC:

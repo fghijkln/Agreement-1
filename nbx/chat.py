@@ -131,14 +131,14 @@ class RelayClient:
 
 class ChatSession:
 
-    def __init__(self, identity: Identity, peer_pub_b64: str, relay_base: str, speaks_first: bool):
+    def __init__(self, identity: Identity, peer_pub_b64: str, relay_base: str, speaks_first: bool | None=None):
         self.identity = identity
         self.my_fp = fingerprint8(identity.export_public())
         self.peer_pub_b64 = peer_pub_b64
         self.peer_fp = fingerprint8(peer_pub_b64)
         self.peer_ed_pub = Identity.parse_public(peer_pub_b64)[1]
         self.client = RelayClient(relay_base)
-        self.speaks_first = speaks_first
+        self.speaks_first = self.my_fp < self.peer_fp if speaks_first is None else speaks_first
         self.session: RatchetSession | None = None
         self._pending: list[bytes] = []
         self._hs_candidate: bytes | None = None
@@ -192,7 +192,7 @@ class ChatSession:
                 out.append((msg.PT_TEXT, self.session.decrypt(m['body'], outer_aad=msg.routing_aad(msg.PT_TEXT, m['sender_fp'], m['recv_fp'])).decode('utf-8')))
         return out
 
-def run_chat(identity: Identity, peer_pub_b64: str, relay_base: str, speaks_first: bool, poll: float=2.0):
+def run_chat(identity: Identity, peer_pub_b64: str, relay_base: str, speaks_first: bool | None=None, poll: float=2.0):
     me = ChatSession(identity, peer_pub_b64, relay_base, speaks_first)
     my_fp_short = identity.fingerprint()
     print(f'[nbx chat] my fingerprint: {my_fp_short}')

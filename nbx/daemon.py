@@ -56,6 +56,7 @@ class ContactSession:
         self.session = hs
         self.daemon.save_session(self)
         self.daemon.log_event(f'会话建立 ✓ {self.peer_fp.hex()}')
+        self.daemon.flush_pending_texts(self)
         self.daemon.flush_outbox()
 
     def send_text(self, text: str) -> dict:
@@ -97,21 +98,20 @@ class Daemon:
         id_path = self.state_dir / 'identity.key'
         enc_path = self.state_dir / 'identity.key.enc'
         if enc_path.exists() and passphrase:
+            os.chmod(enc_path, 0o600)
             self.identity = Identity.load_encrypted(str(enc_path), passphrase)
         elif id_path.exists():
+            os.chmod(id_path, 0o600)
             self.identity = Identity.load(str(id_path))
             if passphrase:
                 self.identity.save_encrypted(str(enc_path), passphrase)
-                os.chmod(enc_path, 384)
                 id_path.unlink()
         else:
             self.identity = Identity.generate()
             if passphrase:
                 self.identity.save_encrypted(str(enc_path), passphrase)
-                os.chmod(enc_path, 384)
             else:
                 self.identity.save(str(id_path))
-                os.chmod(id_path, 384)
         self.my_fp = fingerprint8(self.identity.export_public())
         # 静态加密密钥：默认由身份私钥经 HKDF 域分离派生（身份文件用 passphrase
         # 加密时，状态目录被整体拷走也无法解出会话/历史）；也可显式传入
@@ -299,6 +299,16 @@ class Daemon:
         if sent:
             self.log_event(f'outbox 补发 {sent} 条')
         return sent
+
+    def flush_pending_texts(self, cs: ContactSession) -> int:
+        """处理握手前暂存的 TEXT；须先于 outbox 补发推进 ratchet。"""
+        pending = self._pending_texts.pop(cs.peer_fp, [])
+        for blob in pending:
+            try:
+                self._handle_envelope(blob)
+            except Exception as e:
+                self.log_event(f'暂存 TEXT 处理失败 from {cs.peer_fp.hex()}: {errors.classify(e)}')
+        return len(pending)
 
     def history(self, peer_pub_b64: str, limit: int=50) -> list[dict]:
         cs = self.contacts.get(peer_pub_b64)

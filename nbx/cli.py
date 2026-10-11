@@ -294,7 +294,7 @@ def main(argv=None):
         from .chat import run_chat
         from .fskey import Identity
         ident = Identity.load(args.my_id)
-        run_chat(ident, args.to_pub, args.relay, speaks_first=False, poll=args.poll)
+        run_chat(ident, args.to_pub, args.relay, poll=args.poll)
 
 def _verify_from_pub(args, pub_text: str):
     """解密前的发送方公钥校验（只读）。返回一个回调，调用方须在解密+验签成功后
