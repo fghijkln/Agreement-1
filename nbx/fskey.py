@@ -62,6 +62,7 @@ class Identity:
         if blob[:6] != cls.MAGIC_ENC:
             raise ValueError('not an encrypted identity file')
         n_exp, r_exp, p_exp = (blob[6], blob[7], blob[8])
+        storage.validate_scrypt_parameters(n_exp, r_exp, p_exp)
         salt, nonce, ct = (blob[9:25], blob[25:37], blob[37:])
         kdf = Scrypt(salt=salt, length=32, n=1 << n_exp, r=r_exp, p=p_exp)
         key = kdf.derive(passphrase.encode('utf-8'))
@@ -117,8 +118,9 @@ def open_envelope(blob: bytes, recipient: Identity, sender_x_pub: bytes, sender_
     ct = blob[104 + NONCE_SIZE:]
     ed25519.Ed25519PublicKey.from_public_bytes(sender_ed_pub).verify(sig, eph_pub + ts + recipient.x_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw) + ct)
     replay.check_timestamp(ts, max_skew)
-    if cache is not None:
-        cache.check_and_remember(replay.envelope_id(eph_pub, ct))
     shared = recipient.x_priv.exchange(x25519.X25519PublicKey.from_public_bytes(eph_pub))
     key = _session_key(shared, eph_pub, recipient.x_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
-    return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+    plaintext = ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+    if cache is not None:
+        cache.check_and_remember(replay.envelope_id(eph_pub, ct))
+    return plaintext

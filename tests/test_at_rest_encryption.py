@@ -8,7 +8,7 @@ import time
 import pytest
 
 from nbx import fskey, storage
-from nbx.contacts import ContactBook
+from nbx.contacts import ContactBook, fp_b32, fp_of_pub
 from nbx.daemon import Daemon, _b64e
 from nbx.ratchet import RatchetSession
 
@@ -129,23 +129,16 @@ def test_session_file_swap_between_peers_rejected(tmp_path):
         d.load_session(cb)
 
 
-def test_legacy_plaintext_session_migrated(tmp_path):
+def test_legacy_plaintext_session_is_rejected(tmp_path):
     d = _mk(tmp_path)
     peer = fskey.Identity.generate().export_public()
     cs = d.add_contact(peer)
     sess, other = _pair()
     legacy = sess.export_state()
     d._session_path(cs).write_bytes(legacy)
-    # 1) 运行中：旧明文可直接读取
-    d.load_session(cs)
-    assert cs.session is not None
-    # 2) 重启：启动时自动迁移为加密格式
-    d2 = _mk(tmp_path)
-    raw = d2._session_path(cs).read_bytes()
-    assert storage.is_sealed(raw) and legacy not in raw
-    cs2 = d2.add_contact(peer)
-    d2.load_session(cs2)
-    assert cs2.session.decrypt(other.encrypt(b'after-migrate')) == b'after-migrate'
+    with pytest.raises(RuntimeError, match='plaintext session state'):
+        d.load_session(cs)
+    assert d._session_path(cs).read_bytes() == legacy
 
 
 # ---- 消息历史 / outbox ----
@@ -243,8 +236,12 @@ def test_contactbook_encrypted_session_and_legacy_migration(tmp_path):
     # 旧格式（明文 session）写入
     legacy = ContactBook(path)
     c = legacy.add(fskey.Identity.generate().export_public())
-    c.session_state = state
     legacy.save()
+    with open(path, encoding='utf-8') as source:
+        data = json.load(source)
+    data[fp_b32(c.fp)]['session'] = state
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
     with open(path) as fh:
         assert state in fh.read()
     # 用密钥打开：可读旧明文，save 后迁移
@@ -267,3 +264,32 @@ def test_contactbook_encrypted_session_and_legacy_migration(tmp_path):
     with open(path, 'w') as f:
         json.dump(data, f)
     assert ContactBook(path, storage_key=key).load_session(c.fp) is None
+
+
+def test_contactbook_requires_storage_key_for_session_persistence(tmp_path):
+    path = str(tmp_path / 'no-key.json')
+    book = ContactBook(path)
+    c = book.add(fskey.Identity.generate().export_public())
+    sess, _ = _pair()
+    with pytest.raises(ValueError, match='storage_key'):
+        book.store_session(c.fp, sess)
+
+    c.session_state = sess.export_state().decode('ascii')
+    with pytest.raises(ValueError, match='storage_key'):
+        book.save()
+    assert not os.path.exists(path), '缺少密钥时不得落盘明文会话状态'
+
+
+def test_contactbook_ignores_legacy_plaintext_without_storage_key(tmp_path):
+    path = str(tmp_path / 'legacy-no-key.json')
+    pub = fskey.Identity.generate().export_public()
+    peer_fp = fp_of_pub(pub)
+    state = _pair()[0].export_state().decode('ascii')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({fp_b32(peer_fp): {'pub': pub, 'addrs': [], 'pref': [], 'session': state}}, f)
+
+    book = ContactBook(path)
+    assert book.load_session(peer_fp) is None
+    book.save()
+    with open(path, encoding='utf-8') as f:
+        assert state not in f.read()

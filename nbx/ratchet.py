@@ -14,6 +14,7 @@ MAGIC_STATE = b'NBXRATCHST1'
 HEADER_SIZE = 40
 NONCE_SIZE = 12
 MAX_SKIP = 256
+MAX_STATE_BLOB_BYTES = 32 * 1024
 HANDSHAKE_SIZE = 9 + 8 + 8 + 32 + 8 + 64
 HANDSHAKE_MAX_AGE = 120.0
 
@@ -139,6 +140,8 @@ class RatchetSession:
     @classmethod
     def import_state(cls, blob: bytes) -> 'RatchetSession':
         import base64 as _b64
+        if len(blob) > MAX_STATE_BLOB_BYTES:
+            raise ValueError('ratchet state blob is too large')
         raw = _b64.b64decode(blob)
         mlen = len(MAGIC_STATE)
         if raw[:mlen] != MAGIC_STATE or raw[mlen] != 1:
@@ -158,6 +161,8 @@ class RatchetSession:
         s._dh_self_pub = _raw_pub(s._dh_self)
         s._dh_remote_pub = fields[5]
         sk_blob = fields[6]
+        if len(sk_blob) % 68 or len(sk_blob) > MAX_SKIP * 68:
+            raise ValueError('ratchet state has too many skipped keys or malformed skipped-key data')
         po = 0
         while po < len(sk_blob):
             pub, no = (sk_blob[po:po + 32], struct.unpack('<I', sk_blob[po + 32:po + 36])[0])
@@ -209,7 +214,8 @@ class RatchetSession:
     def _skip_to(self, ratchet_pub: bytes, until: int):
         if self._recv_ck is None:
             return
-        if until - self._recv_n > MAX_SKIP:
+        needed = until - self._recv_n
+        if needed > MAX_SKIP or len(self._skipped) + max(0, needed) > MAX_SKIP:
             raise ValueError('too many skipped messages')
         while self._recv_n < until:
             self._recv_ck, mk = _kdf_ck(self._recv_ck)

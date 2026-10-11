@@ -59,13 +59,15 @@ def test_state_blob_rejects_garbage(tmp_path):
     print('✓ 坏状态 blob 拒绝')
 
 def test_contact_book_persistence(tmp_path):
+    from nbx import storage
     path = str(tmp_path / 'contacts.json')
     a, b, sa, sb = _setup_pair()
-    book = ContactBook(path)
+    key = storage.derive_storage_key(b'contact-book-test-key', b'contacts')
+    book = ContactBook(path, storage_key=key)
     c = book.add(b.export_public())
     book.store_session((b_fp := c.fp), sb)
     book.save()
-    book2 = ContactBook(path)
+    book2 = ContactBook(path, storage_key=key)
     got = book2.get(b_fp)
     assert got is not None
     s = book2.load_session(b_fp)
@@ -75,12 +77,14 @@ def test_contact_book_persistence(tmp_path):
 
 def test_load_session_corrupt_returns_none(tmp_path):
     path = str(tmp_path / 'c.json')
-    book = ContactBook(path)
+    from nbx import storage
+    key = storage.derive_storage_key(b'contact-book-test-key', b'contacts')
+    book = ContactBook(path, storage_key=key)
     import base64 as _b64
     c = book.add(_b64.b64encode(b'x' * 64).decode())
     c.session_state = b'broken'
     book.save()
-    book2 = ContactBook(path)
+    book2 = ContactBook(path, storage_key=key)
     assert book2.load_session(c.fp) is None
     print('✓ 损坏的会话状态 → load 返回 None（不崩溃）')
 

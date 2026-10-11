@@ -44,6 +44,32 @@ def test_prev_len_uint32_cannot_trigger_mass_kdf():
     assert state_fingerprint(b) == before
     assert len(b._skipped) <= MAX_SKIP, 'skipped 不得爆炸'
 
+
+def test_skipped_key_budget_is_global_across_chain_history():
+    a, b = mk_pair()
+    a.encrypt(b'msg0')
+    next_message = a.encrypt(b'msg1')
+    for i in range(MAX_SKIP):
+        b._skipped[(i.to_bytes(32, 'big'), i)] = b'k' * 32
+    before = state_fingerprint(b)
+    with pytest.raises(ValueError, match='too many skipped'):
+        b.decrypt(next_message)
+    assert state_fingerprint(b) == before
+
+
+def test_import_rejects_oversized_skipped_key_state():
+    a, b = mk_pair()
+    for i in range(MAX_SKIP + 1):
+        b._skipped[(i.to_bytes(32, 'big'), i)] = b'k' * 32
+    with pytest.raises(ValueError, match='too many skipped keys'):
+        RatchetSession.import_state(b.export_state())
+
+
+def test_import_rejects_oversized_state_before_base64_decode():
+    from nbx.ratchet import MAX_STATE_BLOB_BYTES
+    with pytest.raises(ValueError, match='too large'):
+        RatchetSession.import_state(b'A' * (MAX_STATE_BLOB_BYTES + 1))
+
 def test_tampered_out_of_order_keeps_skipped_key():
     a, b = mk_pair()
     w1 = a.encrypt(b'msg1')

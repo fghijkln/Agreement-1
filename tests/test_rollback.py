@@ -62,7 +62,7 @@ def test_equal_progress_loads_fine(tmp_path):
     assert cs2.session is not None
     print('✓ R2-04: 正常重启不受影响')
 
-def test_no_epoch_log_legacy_upgrade(tmp_path):
+def test_plaintext_state_without_epoch_log_is_rejected(tmp_path):
     da = Daemon(str(tmp_path / 'state-a'), 'https://relay.example')
     peer_pub = fskey.Identity.generate().export_public()
     cs = da.add_contact(peer_pub)
@@ -71,21 +71,30 @@ def test_no_epoch_log_legacy_upgrade(tmp_path):
     da._session_path(cs).write_bytes(sess.export_state())
     da.contacts.clear()
     cs2 = da.add_contact(peer_pub)
+    with pytest.raises(RuntimeError, match='plaintext session state'):
+        da.load_session(cs2)
+
+def test_new_ratchet_chain_counter_reset_is_accepted(tmp_path):
+    da = Daemon(str(tmp_path / 'state-a'), 'https://relay.example')
+    peer_pub = fskey.Identity.generate().export_public()
+    cs = da.add_contact(peer_pub)
+    sess, _ = _established_pair()
+    sess._recv_n = 15
+    sess._send_n = 27
+    cs.session = sess
+    da.save_session(cs)
+
+    # A fresh DH chain legitimately restarts its per-chain message counters.
+    sess._dh_remote_pub = bytes([sess._dh_remote_pub[0] ^ 1]) + sess._dh_remote_pub[1:]
+    sess._recv_n = 0
+    sess._send_n = 0
+    da.save_session(cs)
+    da.contacts.clear()
+    cs2 = da.add_contact(peer_pub)
     da.load_session(cs2)
     assert cs2.session is not None
-    print('✓ R2-04: 旧版本（无 epoch 日志）兼容')
 
-def test_r2_05_tuple_beats_scalar_collision(tmp_path):
-    from nbx.daemon import _progress_of
-
-    class _Fake:
-        recv_n = 4
-        send_n = 1500000
-    assert _progress_of(_Fake()) < (5, 0), '元组序必须判 (4,1500000) < (5,0)'
-    assert 4 * (1 << 20) + 1500000 > 5 * (1 << 20) + 0
-    print('R2-05 ok: (recv_n, send_n) 元组序修复标量碰撞')
-
-def test_r2_05_rollback_with_stale_recv(tmp_path):
+def test_rollback_of_sealed_state_against_authenticated_anchor(tmp_path):
     da = Daemon(str(tmp_path / 'state-a'), 'https://relay.example')
     peer_pub = fskey.Identity.generate().export_public()
     cs = da.add_contact(peer_pub)
@@ -93,8 +102,10 @@ def test_r2_05_rollback_with_stale_recv(tmp_path):
     cs.session = sess
     sess.encrypt(b'x')
     da.save_session(cs)
-    sess0, _ = _established_pair()
-    da._session_path(cs).write_bytes(sess0.export_state())
+    old_blob = da._session_path(cs).read_bytes()
+    sess.encrypt(b'advance')
+    da.save_session(cs)
+    da._session_path(cs).write_bytes(old_blob)
     da.contacts.clear()
     cs2 = da.add_contact(peer_pub)
     with pytest.raises(RuntimeError, match='rollback'):

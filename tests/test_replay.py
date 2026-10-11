@@ -3,6 +3,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import pytest
+from cryptography.exceptions import InvalidTag
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nbx import fskey, replay
 from nbx.fskey import Identity
@@ -74,6 +76,18 @@ def test_fs_replay_rejected(tmp_path):
         assert 'replay' in str(e)
     print('✓ FS：同一信封第二次解封被拒绝（缓存）')
 
+def test_fs_unauthenticated_nonce_cannot_poison_replay_cache(tmp_path):
+    a, b = (Identity.generate(), Identity.generate())
+    env = fskey.seal_envelope(b'data', a, *_parse(b)[:2])
+    ax, ae = _parse(a)[:2]
+    cache = replay.ReplayCache(str(tmp_path / 'fs_nonce.json'))
+    tampered = bytearray(env)
+    tampered[104] ^= 1
+    with pytest.raises(InvalidTag):
+        fskey.open_envelope(bytes(tampered), b, ax, ae, cache=cache)
+    assert replay.envelope_id(env[:32], env[116:]).hex() not in cache._mem
+    assert fskey.open_envelope(env, b, ax, ae, cache=cache) == b'data'
+
 def test_fs_replay_cache_optional(tmp_path):
     a, b = (Identity.generate(), Identity.generate())
     env = fskey.seal_envelope(b'data', a, *_parse(b)[:2])
@@ -128,6 +142,20 @@ def test_pq_replay_rejected(tmp_path):
         assert 'replay' in str(e)
     print('✓ PQ：同一信封第二次解封被拒绝')
 
+def test_pq_unauthenticated_nonce_cannot_poison_replay_cache(tmp_path):
+    a, b = (PQIdentity.generate(), PQIdentity.generate())
+    env = pq.seal_pq(b'data', a, *_parse_pq(b))
+    ax, ae, _ = _parse_pq(a)
+    cache = replay.ReplayCache(str(tmp_path / 'pq_nonce.json'))
+    nonce_offset = 32 + 1088 + 8 + 64
+    tampered = bytearray(env)
+    tampered[nonce_offset] ^= 1
+    with pytest.raises(InvalidTag):
+        pq.open_pq(bytes(tampered), b, ax, ae, cache=cache)
+    eid = replay.envelope_id(env[:32 + 1088], env[nonce_offset + 12:])
+    assert eid.hex() not in cache._mem
+    assert pq.open_pq(env, b, ax, ae, cache=cache) == b'data'
+
 def test_pq_new_envelope_not_false_positive(tmp_path):
     a, b = (PQIdentity.generate(), PQIdentity.generate())
     cache = replay.ReplayCache(str(tmp_path / 'pq2.json'))
@@ -169,14 +197,11 @@ def test_pq_old_attacks_still_blocked(tmp_path):
         pass
     print('✓ PQ 回归：密文篡改/冒充仍被拒绝')
 
-def test_pq_forward_secrecy_structure(tmp_path):
+def test_pq_recipient_key_compromise_exposes_archived_envelope(tmp_path):
     a, b = (PQIdentity.generate(), PQIdentity.generate())
     msg = b'secret must stay'
     env = pq.seal_pq(msg, a, *_parse_pq(b))
-    leaked = b.to_bytes()
-    assert msg not in leaked
     assert pq.open_pq(env, b, *_parse_pq(a)[:2]) == msg
-    print('✓ PQ 回归：前向保密结构未被重放防护破坏')
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

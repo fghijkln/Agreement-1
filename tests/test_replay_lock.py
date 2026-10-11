@@ -118,8 +118,8 @@ def test_oversized_file_does_not_crash_or_clear(tmp_path):
 
     cache = replay.ReplayCache(str(path))
     assert cache._mem == {}
-    cache.check_and_remember(b'\x01' * 16)
-    assert b'\x01' * 16 and (b'\x01' * 16).hex() in cache._mem
+    with pytest.raises(RuntimeError, match='corrupt'):
+        cache.check_and_remember(b'\x01' * 16)
     assert path.stat().st_size == original_size, '损坏/超大文件不得被覆盖清空'
 
 
@@ -128,9 +128,11 @@ def test_malformed_json_does_not_crash(tmp_path):
     path.write_text('{ this is not valid json')
     cache = replay.ReplayCache(str(path))
     assert cache._mem == {}
+    with pytest.raises(RuntimeError, match='corrupt'):
+        cache.check_and_remember(b'\x02' * 16)
 
 
-def test_invalid_entries_ignored(tmp_path):
+def test_invalid_entries_mark_cache_corrupt(tmp_path):
     path = tmp_path / 'mix.json'
     now = int(time.time())
     data = {
@@ -145,3 +147,34 @@ def test_invalid_entries_ignored(tmp_path):
     path.write_text(json.dumps(data))
     cache = replay.ReplayCache(str(path))
     assert cache._mem == {'aa' * 16: now}
+    with pytest.raises(RuntimeError, match='corrupt'):
+        cache.check_and_remember(bytes.fromhex('cc' * 16))
+
+
+def test_cache_write_failure_rejects_envelope(tmp_path, monkeypatch):
+    path = str(tmp_path / 'write-failure.json')
+    cache = replay.ReplayCache(path)
+
+    def fail_write(*args, **kwargs):
+        raise OSError('simulated disk failure')
+
+    monkeypatch.setattr(replay.storage, 'atomic_write', fail_write)
+    with pytest.raises(RuntimeError, match='persistence failed'):
+        cache.check_and_remember(b'\x03' * 16)
+
+
+def test_lock_failure_rejects_envelope(tmp_path, monkeypatch):
+    path = str(tmp_path / 'lock-failure.json')
+    cache = replay.ReplayCache(path)
+
+    class BrokenFcntl:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        @staticmethod
+        def flock(_fd, _operation):
+            raise OSError('simulated lock failure')
+
+    monkeypatch.setattr(replay, 'fcntl', BrokenFcntl)
+    with pytest.raises(RuntimeError, match='lock acquisition failed'):
+        cache.check_and_remember(b'\x04' * 16)

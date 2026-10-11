@@ -170,6 +170,28 @@ def test_pq_identity_wrong_passphrase_rejected(tmp_path):
     with pytest.raises(Exception):
         PQIdentity.load_encrypted(str(p), 'nope')
 
+@pytest.mark.parametrize('kind', ['classic', 'pq'])
+@pytest.mark.parametrize('params', [(255, 8, 1), (15, 255, 1), (15, 8, 255), (14, 8, 1)])
+def test_encrypted_identity_rejects_unsafe_scrypt_header(tmp_path, kind, params):
+    import base64
+
+    if kind == 'classic':
+        ident = fskey.Identity.generate()
+        p = tmp_path / 'identity.enc'
+        ident.save_encrypted(str(p), 'passphrase')
+        load = lambda: fskey.Identity.load_encrypted(str(p), 'passphrase')
+    else:
+        ident = PQIdentity.generate()
+        p = tmp_path / 'pq-identity.enc'
+        ident.save_encrypted(str(p), 'passphrase')
+        load = lambda: PQIdentity.load_encrypted(str(p), 'passphrase')
+
+    blob = bytearray(base64.b64decode(p.read_bytes().strip()))
+    blob[6:9] = bytes(params)
+    p.write_bytes(base64.b64encode(blob) + b'\n')
+    with pytest.raises(ValueError, match='Scrypt parameters'):
+        load()
+
 def test_daemon_passphrase_creates_encrypted_identity(tmp_path):
     from nbx.daemon import Daemon
     sd = tmp_path / 'state'

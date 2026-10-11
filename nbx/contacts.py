@@ -49,9 +49,9 @@ class Contact:
         return used[-1] if used else None
 
 class ContactBook:
-    """通讯录。传入 storage_key（32B，见 nbx.storage.derive_storage_key）时，
-    会话状态以 AEAD 加密存为 'session_enc'；旧版明文 'session' 字段仍可读取，
-    并在下一次 save() 时迁移为加密格式。文件以 0600 原子写入。"""
+    """通讯录。会话状态只有在传入 storage_key 时才可读取或持久化；
+    旧版明文会话仅在提供密钥时可读，并在下一次 save() 时迁移为 AEAD 密文。
+    文件以 0600 原子写入。"""
 
     def __init__(self, path: str, storage_key: bytes | None=None):
         self.path = path
@@ -73,6 +73,10 @@ class ContactBook:
                             state = storage.open_sealed(self._key, base64.b64decode(enc), self._ctx(k)).decode('ascii')
                         except (storage.StorageError, ValueError):
                             state = None
+                elif self._key is None:
+                    # Never rehydrate legacy plaintext session material without
+                    # an explicit at-rest key.
+                    state = None
                 self._c[k] = Contact(v['pub'], state, v.get('addrs'), v.get('pref'))
 
     @staticmethod
@@ -96,8 +100,10 @@ class ContactBook:
             elif st is None and k in self._opaque_enc:
                 entry['session'] = None
                 entry['session_enc'] = self._opaque_enc[k]
+            elif st is not None:
+                raise ValueError('storage_key is required to persist ratchet session state')
             else:
-                entry['session'] = st
+                entry['session'] = None
             data[k] = entry
         storage.atomic_write(self.path, json.dumps(data, indent=1).encode('utf-8'))
 
@@ -119,6 +125,8 @@ class ContactBook:
         c = self.get(fp)
         if c is None:
             raise KeyError(f'unknown contact fp {fp.hex()}')
+        if self._key is None:
+            raise ValueError('storage_key is required to persist ratchet session state')
         c.session_state = session.export_state().decode('ascii')
 
     def load_session(self, fp: bytes) -> RatchetSession | None:

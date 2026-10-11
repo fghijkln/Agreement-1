@@ -7,7 +7,7 @@ from nbx import fskey
 def test_roundtrip(tmp_path):
     alice = fskey.Identity.generate()
     bob = fskey.Identity.generate()
-    msg = '机密消息 forward secrecy test 🤫'.encode()
+    msg = '机密消息 ephemeral envelope test 🤫'.encode()
     env = fskey.seal_envelope(msg, alice, *fskey.Identity.parse_public(bob.export_public()))
     out = fskey.open_envelope(env, bob, *fskey.Identity.parse_public(alice.export_public()))
     assert out == msg
@@ -37,14 +37,14 @@ def test_tamper_rejected(tmp_path):
         pass
     print('✓ 密文篡改被拒绝')
 
-def test_forward_secrecy(tmp_path):
+def test_recipient_key_compromise_exposes_archived_envelope(tmp_path):
     alice, bob = (fskey.Identity.generate(), fskey.Identity.generate())
     msg = b'secret that must stay secret'
     env = fskey.seal_envelope(msg, alice, *fskey.Identity.parse_public(bob.export_public()))
     assert fskey.open_envelope(env, bob, *fskey.Identity.parse_public(alice.export_public())) == msg
-    leaked = bob.to_bytes()
-    assert msg not in leaked
-    print('✓ 前向保密结构成立（临时私钥不出现在信封/泄露材料中）')
+    # The envelope uses the recipient's long-term X25519 key, so this identity
+    # remains sufficient to decrypt a recorded envelope after later compromise.
+    assert fskey.open_envelope(env, bob, *fskey.Identity.parse_public(alice.export_public())) == msg
 
 def test_envelope_size_stable(tmp_path):
     a, b = (fskey.Identity.generate(), fskey.Identity.generate())
@@ -58,6 +58,6 @@ if __name__ == '__main__':
         test_roundtrip(tmp_path)
         test_wrong_sender_rejected(tmp_path)
         test_tamper_rejected(tmp_path)
-        test_forward_secrecy(tmp_path)
+        test_recipient_key_compromise_exposes_archived_envelope(tmp_path)
         test_envelope_size_stable(tmp_path)
-    print('\nFS 全部测试通过 ✅')
+    print('\n传统信封全部测试通过')

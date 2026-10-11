@@ -44,6 +44,11 @@ def test_async_handshake_and_outbox(tmp_path):
     hs_back = [p for p in b.client.posted if p != a_hs]
     assert len(hs_back) == 1, 'B 必须回发自己的握手'
     assert len(list((b.state_dir / 'sessions').glob('*.session'))) == 1
+    b_session = b.contacts[pub_a].session
+    posted_before = len(b.client.posted)
+    b._handle_envelope(a_hs)
+    assert b.contacts[pub_a].session is b_session, '重复握手不得重置已建立的 ratchet 会话'
+    assert len(b.client.posted) == posted_before, '重复握手不得触发新握手'
 
 def test_speaks_first_deterministic(tmp_path):
     a = mk_daemon(tmp_path, 'a')

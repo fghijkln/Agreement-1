@@ -33,6 +33,12 @@ HEADER_SIZE = len(MAGIC) + 1 + NONCE_SIZE
 LINE_PREFIX = 'nbxseal1:'
 
 
+def validate_scrypt_parameters(n_exp: int, r: int, p: int) -> None:
+    """Validate the only Scrypt profile currently emitted by identity v1 files."""
+    if (n_exp, r, p) != (15, 8, 1):
+        raise ValueError('unsupported or unsafe identity Scrypt parameters')
+
+
 class StorageError(ValueError):
     """静态加密数据无法解开（篡改、密钥不对、版本不支持）。"""
 

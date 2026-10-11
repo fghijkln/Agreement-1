@@ -48,17 +48,17 @@ def main(argv=None):
     bdl = sub.add_parser('bundle', help='把多个文件打成一个 .nbx')
     bdl.add_argument('outfile')
     bdl.add_argument('infiles', nargs='+')
-    idn = sub.add_parser('identity', help='前向保密身份密钥管理')
+    idn = sub.add_parser('identity', help='身份密钥管理')
     idn.add_argument('action', choices=['new', 'show', 'pubout'])
     idn.add_argument('idfile', nargs='?', default='nbx_id.key')
     idn.add_argument('--out', default=None, help='pubout 时导出公钥到的文件')
-    fs = sub.add_parser('seal', help='前向保密加密（X25519+Ed25519 信封）')
+    fs = sub.add_parser('seal', help='临时密钥加密（X25519+Ed25519 信封；接收方长期密钥泄露可能暴露历史信封）')
     fs.add_argument('infile')
     fs.add_argument('outfile')
     fs.add_argument('--my-id', default='nbx_id.key')
     fs.add_argument('--to-pub', required=True, help='接收方身份公钥文件(Base64)')
-    un = sub.add_parser('unseal', help='解密前向保密信封',
-                        description='解密前向保密信封。发送方公钥可信性：给出 --from-fp 时显式核对指纹；'
+    un = sub.add_parser('unseal', help='解密临时密钥信封',
+                        description='解密临时密钥信封；接收方长期私钥泄露可能暴露历史信封。发送方公钥可信性：给出 --from-fp 时显式核对指纹；'
                                     '否则按 --from-name（默认 --from-pub 绝对路径）首次信任(TOFU)，'
                                     '指纹写入 pin 文件，之后同一名字换密钥将被拒绝。')
     un.add_argument('infile')
@@ -75,13 +75,13 @@ def main(argv=None):
     an.add_argument('outfile')
     an.add_argument('--keyfile', default='nbx.key')
     an.add_argument('--pad', type=int, default=0, help='长度填充块大小(如4096)')
-    pqc = sub.add_parser('pqseal', help='后量子混合信封 (X25519+ML-KEM-768)')
+    pqc = sub.add_parser('pqseal', help='后量子混合信封 (X25519+ML-KEM-768；接收方长期密钥泄露可能暴露历史信封)')
     pqc.add_argument('infile')
     pqc.add_argument('outfile')
     pqc.add_argument('--my-id', default='nbx_id.key')
     pqc.add_argument('--to-pub', required=True)
     pqu = sub.add_parser('pqunseal', help='解封后量子信封',
-                         description='解封后量子混合信封。发送方公钥可信性：给出 --from-fp 时显式核对指纹；'
+                         description='解封后量子混合信封；接收方长期私钥泄露可能暴露历史信封。发送方公钥可信性：给出 --from-fp 时显式核对指纹；'
                                      '否则按 --from-name（默认 --from-pub 绝对路径）首次信任(TOFU)，'
                                      '指纹写入 pin 文件，之后同一名字换密钥将被拒绝。')
     pqu.add_argument('infile')
@@ -212,7 +212,7 @@ def main(argv=None):
         env = fskey.seal_envelope(data, ident, to_x, to_ed)
         with open(args.outfile, 'wb') as f:
             f.write(env)
-        print(f'sealed {args.infile} -> {args.outfile} ({len(env)} bytes, forward-secure, replay-protected)')
+        print(f'sealed {args.infile} -> {args.outfile} ({len(env)} bytes, ephemeral-key encrypted, replay-protected; recipient-key compromise may expose archived envelopes)')
     elif args.cmd == 'unseal':
         from . import fskey, replay
         ident = fskey.Identity.load(args.my_id)
@@ -257,7 +257,7 @@ def main(argv=None):
         env = pq.seal_pq(data, ident, *rec)
         with open(args.outfile, 'wb') as f:
             f.write(env)
-        print(f'pq-sealed {args.infile} -> {args.outfile} ({len(env)}B, X25519+ML-KEM-768, replay-protected)')
+        print(f'pq-sealed {args.infile} -> {args.outfile} ({len(env)}B, X25519+ML-KEM-768, replay-protected; recipient-key compromise may expose archived envelopes)')
     elif args.cmd == 'pqunseal':
         from . import pq, replay
         ident = pq.PQIdentity.load(args.my_id)

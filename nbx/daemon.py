@@ -1,5 +1,7 @@
 from __future__ import annotations
 import base64
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -153,15 +155,32 @@ class Daemon:
         return self.state_dir / 'sessions' / f'{_b64e(peer_fp)}.epoch'
 
     @staticmethod
-    def _parse_epoch_lines(text: str) -> list[tuple[int, tuple[int, int]]]:
+    def _parse_epoch_lines(text: str) -> list[tuple[int, str | None]]:
         out = []
         for line in text.splitlines():
+            if not line.strip():
+                continue
             parts = line.split()
-            if len(parts) == 3:
+            try:
+                timestamp = int(parts[0])
+            except (ValueError, IndexError):
+                raise ValueError('malformed session epoch log') from None
+            if len(parts) == 2 and len(parts[1]) == 64:
                 try:
-                    out.append((int(parts[0]), (int(parts[1]), int(parts[2]))))
+                    bytes.fromhex(parts[1])
                 except ValueError:
-                    continue
+                    raise ValueError('malformed session epoch tag') from None
+                out.append((timestamp, parts[1].lower()))
+            elif len(parts) == 3:
+                # Legacy counter-only entries are incomparable across DH chains.
+                try:
+                    int(parts[1])
+                    int(parts[2])
+                except ValueError:
+                    raise ValueError('malformed legacy session epoch entry') from None
+                out.append((timestamp, None))
+            else:
+                raise ValueError('malformed session epoch log')
         return out
 
     def save_session(self, cs: ContactSession) -> None:
@@ -170,38 +189,37 @@ class Daemon:
         blob = cs.session.export_state()
         sealed = storage.seal(self._storage_key, blob, self._session_ctx(cs.peer_fp))
         storage.atomic_write(self._session_path(cs), sealed)
-        recv_n, send_n = _progress_of(cs.session)
-        ep = self._epoch_log_path(cs.peer_fp)
-        with open(ep, 'a') as f:
-            f.write(f'{int(time.time())} {recv_n} {send_n}\n')
-        os.chmod(ep, 384)
-        with open(ep) as f:
-            entries = self._parse_epoch_lines(f.read())
-        if len(entries) >= 64:
-            last_ts, (lr, ls) = max(entries, key=lambda e: (e[1], e[0]))
-            tmp = ep.with_suffix('.tmp')
-            tmp.write_text(f'{last_ts} {lr} {ls}\n')
-            os.replace(tmp, ep)
-            os.chmod(ep, 384)
+        self._write_session_epoch_anchor(cs.peer_fp, blob)
+
+    def _session_epoch_tag(self, peer_fp: bytes, state: bytes) -> str:
+        return hmac.new(self._storage_key, b'nbx-session-epoch-v1|' + peer_fp + state,
+                        hashlib.sha256).hexdigest()
+
+    def _write_session_epoch_anchor(self, peer_fp: bytes, state: bytes) -> None:
+        line = f'{int(time.time())} {self._session_epoch_tag(peer_fp, state)}\n'.encode('ascii')
+        storage.atomic_write(self._epoch_log_path(peer_fp), line)
 
     def load_session(self, cs: ContactSession) -> None:
         p = self._session_path(cs)
         if not p.exists() or cs.session is not None:
             return
         raw = p.read_bytes()
-        if storage.is_sealed(raw):
-            raw = storage.open_sealed(self._storage_key, raw, self._session_ctx(cs.peer_fp))
-        # else: 旧版明文状态，照常导入；下次 save_session 以加密格式覆盖（迁移）
-        rs = RatchetSession.import_state(raw)
+        if not storage.is_sealed(raw):
+            raise RuntimeError('plaintext session state is rejected; reset the session and perform a new handshake')
+        state = storage.open_sealed(self._storage_key, raw, self._session_ctx(cs.peer_fp))
+        rs = RatchetSession.import_state(state)
         ep = self._epoch_log_path(cs.peer_fp)
         if ep.exists():
             with open(ep) as f:
                 entries = self._parse_epoch_lines(f.read())
-            if entries:
-                _, last = max(entries, key=lambda e: (e[1], e[0]))
-                progress = _progress_of(rs)
-                if progress < last:
-                    raise RuntimeError(f'session state rollback detected for peer {_b64e(cs.peer_fp)}: state progress {progress} < epoch log {last} — refusing to load (possible restore attack; delete BOTH files to reset)')
+            if not entries:
+                raise RuntimeError('session epoch log is empty; refusing to load unanchored state')
+            tags = [tag for _, tag in entries if tag is not None]
+            if tags and any(tag is None for _, tag in entries):
+                raise RuntimeError('session epoch log mixes legacy counters with authenticated anchors')
+            if tags and not hmac.compare_digest(tags[-1], self._session_epoch_tag(cs.peer_fp, state)):
+                raise RuntimeError(f'session state rollback detected for peer {_b64e(cs.peer_fp)}: epoch anchor mismatch')
+        self._write_session_epoch_anchor(cs.peer_fp, state)
         cs.session = rs
 
     @staticmethod
@@ -244,20 +262,12 @@ class Daemon:
         self._migrated.add(path)
 
     def _migrate_at_rest(self) -> None:
-        """把旧版明文的消息历史 / outbox / 会话状态迁移为加密格式。"""
+        """迁移旧版明文消息历史/outbox；旧明文 ratchet 状态不自动导入或升级。"""
         for f in sorted((self.state_dir / 'messages').glob('*.jsonl')):
             self._migrate_jsonl(f)
         self._migrate_jsonl(self._outbox_path())
-        for f in sorted((self.state_dir / 'sessions').glob('*.session')):
-            raw = f.read_bytes()
-            if storage.is_sealed(raw):
-                continue
-            try:
-                peer_fp = _b64d(f.stem)
-                RatchetSession.import_state(raw)
-            except Exception:
-                continue  # 损坏的旧文件原样保留，由 load_session 报错
-            storage.atomic_write(f, storage.seal(self._storage_key, raw, self._session_ctx(peer_fp)))
+        # Plaintext legacy sessions are intentionally not migrated: importing
+        # them would bless unauthenticated state and allow a rollback to persist.
 
     def _append_sealed(self, path: Path, record: dict) -> None:
         self._migrate_jsonl(path)
@@ -352,6 +362,9 @@ class Daemon:
             return
         self.load_session(cs)
         if m['ptype'] == msg.PT_HANDSHAKE:
+            if cs.session is not None:
+                self.log_event(f'已建立会话，忽略重复握手 from {peer_fp.hex()}')
+                return
             try:
                 handshake_age(m['body'])
             except HandshakeStale:

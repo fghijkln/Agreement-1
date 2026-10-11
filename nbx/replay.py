@@ -5,6 +5,7 @@ import os
 import struct
 import time
 from contextlib import contextmanager
+from . import storage
 
 DEFAULT_MAX_SKEW = 300
 DEFAULT_MAX_ENTRIES = 100000
@@ -45,7 +46,7 @@ def check_timestamp(ts_bytes: bytes, max_skew: int=DEFAULT_MAX_SKEW) -> None:
 
 
 def _is_hex_key(key) -> bool:
-    if not isinstance(key, str) or not key or len(key) % 2 != 0:
+    if not isinstance(key, str) or len(key) != 32:
         return False
     return all(c in '0123456789abcdefABCDEF' for c in key)
 
@@ -53,16 +54,16 @@ def _is_hex_key(key) -> bool:
 class ReplayCache:
     """信封重放缓存，跨进程安全。
 
-    - 读-改-写全程持有 ``path + '.lock'`` 上的 ``fcntl.flock(LOCK_EX)``
-      （Windows 降级 ``msvcrt.locking``，二者都不可用时无锁但不报错）。
+    - 读-改-写全程持有 ``path + '.lock'`` 上的跨进程排他锁；锁不可用时拒绝操作。
     - ``check_and_remember`` 在锁内重新从磁盘加载最新内容再判定+写入，
       避免多进程互相覆盖丢失记录。
     - ``max_entries`` 限制条目数，超限按时间戳淘汰最旧。
-    - ``_load`` 只载入 ttl 内、格式正确（hex 键 + int 值）的条目；
-      文件损坏或超过 ``MAX_FILE_BYTES`` 时不崩溃，且不会被覆盖清空。
+    - 文件损坏、超过 ``MAX_FILE_BYTES``、锁失败或写入失败时拒绝解封，避免 fail-open。
     """
 
     def __init__(self, path: str | None=None, ttl: int=86400, max_entries: int=DEFAULT_MAX_ENTRIES):
+        if ttl < 0 or max_entries <= 0:
+            raise ValueError('ttl must be non-negative and max_entries must be positive')
         self.path = path if path is not None else default_cache_path()
         self.ttl = ttl
         self.max_entries = int(max_entries)
@@ -72,16 +73,19 @@ class ReplayCache:
     def _load(self) -> dict:
         self._corrupt = False
         try:
-            st = os.stat(self.path)
-        except (FileNotFoundError, OSError):
+            with open(self.path, 'rb') as f:
+                raw = f.read(MAX_FILE_BYTES + 1)
+        except FileNotFoundError:
             return {}
-        if st.st_size > MAX_FILE_BYTES:
+        except OSError:
+            self._corrupt = True
+            return {}
+        if len(raw) > MAX_FILE_BYTES:
             self._corrupt = True
             return {}
         try:
-            with open(self.path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+            data = json.loads(raw.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             self._corrupt = True
             return {}
         if not isinstance(data, dict):
@@ -93,9 +97,9 @@ class ReplayCache:
         now = int(time.time())
         clean = {}
         for key, value in data.items():
-            if not _is_hex_key(key):
-                continue
-            if isinstance(value, bool) or not isinstance(value, int):
+            if (not _is_hex_key(key) or isinstance(value, bool) or
+                    not isinstance(value, int) or value < 0 or value > now + self.ttl):
+                self._corrupt = True
                 continue
             if now - value > self.ttl:
                 continue
@@ -107,52 +111,52 @@ class ReplayCache:
 
     def _save(self):
         if self._corrupt:
-            return
+            raise RuntimeError('replay cache is corrupt; refusing to overwrite it')
         try:
-            directory = os.path.dirname(os.path.abspath(self.path))
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            tmp = self.path + '.tmp'
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(self._mem, f)
-            os.replace(tmp, self.path)
-        except OSError:
-            pass
+            storage.atomic_write(self.path, json.dumps(self._mem, separators=(',', ':')).encode('utf-8'))
+        except Exception as e:
+            raise RuntimeError('replay cache persistence failed; refusing to accept envelope') from e
+
+    def _require_healthy(self) -> None:
+        if self._corrupt:
+            raise RuntimeError('replay cache is corrupt or unavailable; refusing to accept envelope')
 
     @contextmanager
     def _locked(self):
-        fd = None
         try:
             directory = os.path.dirname(os.path.abspath(self.path))
             if directory:
                 os.makedirs(directory, exist_ok=True)
-            fd = open(self.path + '.lock', 'a+')
-        except OSError:
-            fd = None
-        if fd is not None:
-            try:
-                if fcntl is not None:
-                    fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
-                elif msvcrt is not None:
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
-            except OSError:
-                pass
+            fd = open(self.path + '.lock', 'a+b')
+        except OSError as e:
+            raise RuntimeError('replay cache lock file is unavailable; refusing to accept envelope') from e
+        if fcntl is None and msvcrt is None:
+            fd.close()
+            raise RuntimeError('cross-process replay cache locking is unavailable')
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+            else:
+                fd.seek(0, os.SEEK_END)
+                if fd.tell() == 0:
+                    fd.write(b'\0')
+                    fd.flush()
+                fd.seek(0)
+                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError as e:
+            fd.close()
+            raise RuntimeError('replay cache lock acquisition failed; refusing to accept envelope') from e
         try:
             yield
         finally:
-            if fd is not None:
-                try:
-                    if fcntl is not None:
-                        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-                    elif msvcrt is not None:
-                        msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
-                except OSError:
-                    pass
-                try:
-                    fd.close()
-                except OSError:
-                    pass
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+                else:
+                    fd.seek(0)
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                fd.close()
 
     def _drop_stale(self) -> bool:
         now = int(time.time())
@@ -172,12 +176,14 @@ class ReplayCache:
     def seen(self, eid: bytes) -> bool:
         with self._locked():
             self._mem = self._load()
+            self._require_healthy()
             self._drop_stale()
             return eid.hex() in self._mem
 
     def remember(self, eid: bytes):
         with self._locked():
             self._mem = self._load()
+            self._require_healthy()
             self._drop_stale()
             self._mem[eid.hex()] = int(time.time())
             self._evict()
@@ -190,6 +196,7 @@ class ReplayCache:
     def check_and_remember(self, eid: bytes):
         with self._locked():
             self._mem = self._load()
+            self._require_healthy()
             self._drop_stale()
             key = eid.hex()
             if key in self._mem:
