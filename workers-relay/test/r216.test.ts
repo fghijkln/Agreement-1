@@ -145,6 +145,20 @@ async function admit(fp, bytes) {
         });
     return response;
 }
+async function expireDedupeMarkers(stub) {
+    await runInDurableObject(stub, async (_instance, state) => {
+        const prefix = "message_dedupe_expiry:";
+        const entries = await state.storage.list({ prefix });
+        const expiredAt = Date.now() - 1;
+        for (const [expiryKey, dedupeKey] of entries) {
+            const expiredIndexKey = prefix + String(expiredAt).padStart(16, "0")
+                + expiryKey.slice(prefix.length + 17);
+            await state.storage.delete(expiryKey);
+            await state.storage.put(dedupeKey, { expires_at: expiredAt });
+            await state.storage.put(expiredIndexKey, dedupeKey);
+        }
+    });
+}
 
 describe("R2-16: Durable Object 账本 GC 与稳定退账事件", () => {
     it("GC 过期队列和过期 pending 时释放 Registry 字节与名额", async () => {
@@ -554,6 +568,8 @@ describe("R2-16: Durable Object 账本 GC 与稳定退账事件", () => {
         await stub.fetch("https://do/pop_ack", {
             method: "POST", body: bytesToUuidBytes(pop.release_id),
         });
+        await expireDedupeMarkers(stub);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
         const clearedAlarm = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
         expect(clearedAlarm).toBeNull();
         after = await stats();
@@ -604,6 +620,7 @@ describe("R2-16: Durable Object 账本 GC 与稳定退账事件", () => {
             q[0].at = Date.now() - TTL_MS - 1;
             await state.storage.put("q", q);
         });
+        await expireDedupeMarkers(stub);
         expect(await runDurableObjectAlarm(stub)).toBe(true);
         const finalState = await runInDurableObject(stub, async (_instance, state) => ({
             q: await state.storage.get("q"), alarm: await state.storage.getAlarm(),
@@ -679,4 +696,102 @@ describe("R2-16: Durable Object 账本 GC 与稳定退账事件", () => {
         expect(after.total_bytes).toBe(before.total_bytes);
         expect(after.recip_count).toBe(before.recip_count);
     }, 60_000);
+
+    it("已签名 envelope 按发送者和消息 ID 去重，pop 后重放仍不重复入队或记账", async () => {
+        const before = await stats();
+        const bob = await testKeys();
+        const alice = await testKeys();
+        const bobFp = await fingerprint(bob);
+        const aliceFp = await fingerprint(alice);
+        expect((await SELF.fetch("https://example.com/auth", {
+            method: "POST", body: await authBody(bob),
+        })).status).toBe(200);
+        expect((await SELF.fetch("https://example.com/auth", {
+            method: "POST", body: await authBody(alice),
+        })).status).toBe(200);
+
+        const envelope = packMessage(aliceFp, bobFp, 0x12345678);
+        const signedDelivery = concat(envelope, await deliveryProof(alice, envelope));
+        const first = await SELF.fetch("https://example.com/envelope", {
+            method: "POST", body: signedDelivery,
+        });
+        expect(first.status).toBe(202);
+        expect((await first.json()).duplicate).not.toBe(true);
+
+        const replay = await SELF.fetch("https://example.com/envelope", {
+            method: "POST", body: signedDelivery,
+        });
+        expect(replay.status).toBe(202);
+        expect((await replay.json()).duplicate).toBe(true);
+        let after = await stats();
+        expect(after.total_bytes).toBe(before.total_bytes + envelope.length);
+        expect(after.recip_count).toBe(before.recip_count + 1);
+
+        const inbox = await SELF.fetch("https://example.com/inbox/" + b64u(bobFp), {
+            method: "POST", body: await authProof(bob, bobFp),
+        });
+        expect(inbox.status).toBe(200);
+        const inboxPayload = await inbox.json();
+        expect(inboxPayload.envelopes).toHaveLength(1);
+        expect(inboxPayload.envelopes[0]).toBe(b64u(envelope));
+
+        const replayAfterPop = await SELF.fetch("https://example.com/envelope", {
+            method: "POST", body: signedDelivery,
+        });
+        expect(replayAfterPop.status).toBe(202);
+        expect((await replayAfterPop.json()).duplicate).toBe(true);
+        const emptyInbox = await SELF.fetch("https://example.com/inbox/" + b64u(bobFp), {
+            method: "POST", body: await authProof(bob, bobFp),
+        });
+        expect(emptyInbox.status).toBe(200);
+        expect((await emptyInbox.json()).envelopes).toHaveLength(0);
+
+        after = await stats();
+        expect(after.total_bytes).toBe(before.total_bytes);
+        expect(after.recip_count).toBe(before.recip_count);
+    });
+
+    it("消息去重记录到期后清理索引并允许重新投递", async () => {
+        const before = await stats();
+        const fp = crypto.getRandomValues(new Uint8Array(8));
+        const stub = fpDo(fp);
+        expect((await admit(fp, ENV_LEN)).status).toBe(200);
+        const envelope = envBlob(fp, 73);
+        expect((await stub.fetch("https://do/push", pushRequest(fp, envelope, true))).status).toBe(202);
+
+        const index = await runInDurableObject(stub, async (_instance, state) => {
+            const entries = await state.storage.list({ prefix: "message_dedupe_expiry:" });
+            return [...entries.entries()][0];
+        });
+        expect(index).toBeDefined();
+        const [expiryKey, dedupeKey] = index;
+        const expiredAt = Date.now() - 1;
+        const indexPrefix = "message_dedupe_expiry:";
+        const expiredIndexKey = indexPrefix + String(expiredAt).padStart(16, "0")
+            + expiryKey.slice(indexPrefix.length + 17);
+        await runInDurableObject(stub, async (_instance, state) => {
+            await state.storage.delete(expiryKey);
+            await state.storage.put(dedupeKey, { expires_at: expiredAt });
+            await state.storage.put(expiredIndexKey, dedupeKey);
+        });
+
+        expect((await admit(fp, ENV_LEN)).status).toBe(200);
+        expect((await stub.fetch("https://do/push", pushRequest(fp, envelope, false))).status).toBe(202);
+        const queued = await runInDurableObject(stub, async (_instance, state) => state.storage.get("q"));
+        expect(queued).toHaveLength(2);
+        let after = await stats();
+        expect(after.total_bytes).toBe(before.total_bytes + 2 * ENV_LEN);
+
+        const pop = await (await stub.fetch("https://do/pop", popRequest(fp))).json();
+        expect(pop.envelopes).toHaveLength(2);
+        await registryStub().fetch("https://do/recipient_release", {
+            method: "POST", body: releaseBody(fp, pop.popped_bytes, pop.release_id, pop.release_at),
+        });
+        await stub.fetch("https://do/pop_ack", {
+            method: "POST", body: bytesToUuidBytes(pop.release_id),
+        });
+        after = await stats();
+        expect(after.total_bytes).toBe(before.total_bytes);
+        expect(after.recip_count).toBe(before.recip_count);
+    });
 });

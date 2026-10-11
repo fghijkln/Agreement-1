@@ -27,10 +27,11 @@ function relBody(fp, freed, generation, releaseId, createdAt = Date.now()) {
     new DataView(b.buffer).setBigUint64(44, BigInt(createdAt), true);
     return b;
 }
-function envBlob(n, fp) {
+function envBlob(n, fp, sequence = 0) {
     const b = new Uint8Array(n);
     b.set([0x4e, 0x42, 0x58, 0x4d, 0x53, 0x47, 0x01, 0x00], 0);
     b.set(fp, 20);
+    new DataView(b.buffer).setUint32(28, sequence, true);
     return b;
 }
 async function stats() {
@@ -59,7 +60,7 @@ describe("R2-13 eviction 退账", () => {
                     "x-recipient-generation-epoch": String(admission.generation_epoch),
                     "x-recipient-reset": String(admission.reset_generation === true),
                 },
-                body: envBlob(ENV_LEN, fp),
+                body: envBlob(ENV_LEN, fp, i),
             });
             expect(pr.status).toBe(202);
         }
@@ -77,7 +78,7 @@ describe("R2-13 eviction 退账", () => {
                     "x-recipient-generation-epoch": String(admission.generation_epoch),
                     "x-recipient-reset": String(admission.reset_generation === true),
                 },
-                body: envBlob(ENV_LEN, fp),
+                body: envBlob(ENV_LEN, fp, MAX_PER_FP + i),
             });
             expect(pr.status).toBe(202);
             const pj = (await pr.json());

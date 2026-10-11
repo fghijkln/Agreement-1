@@ -33,7 +33,7 @@ const deliveryProof = async (keys, envelope) => {
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", envelope));
     return concat(tNow(), await sign(keys.priv, concat(new TextEncoder().encode(DELIVERY_INFO), digest, tNow())));
 };
-function packMessage(ptype, sfp, rfp, body) {
+function packMessage(ptype, sfp, rfp, body, sequence = 0) {
     const hdr = new Uint8Array(48);
     hdr.set(MAGIC, 0);
     hdr[8] = 1;
@@ -41,7 +41,7 @@ function packMessage(ptype, sfp, rfp, body) {
     new DataView(hdr.buffer).setUint32(44, body.length, true);
     hdr.set(sfp, 12);
     hdr.set(rfp, 20);
-    hdr.set(new Uint8Array(16).map((_, i) => i), 28);
+    new DataView(hdr.buffer).setUint32(28, sequence, true);
     return concat(hdr, body);
 }
 async function stats() {
@@ -60,7 +60,7 @@ describe("R2-14: /inbox 生产链路退账", () => {
         const r = await stats();
         expect(r.registered).toBe(before.registered + 2);
         for (let i = 0; i < 3; i++) {
-            const env = packMessage(1, aliceFp, bobFp, new TextEncoder().encode("r2-14-" + i));
+            const env = packMessage(1, aliceFp, bobFp, new TextEncoder().encode("r2-14-" + i), i);
             expect(env.length).toBe(55);
             const dr = await SELF.fetch("https://example.com/envelope", {
                 method: "POST", body: concat(env, await deliveryProof(alice, env)),

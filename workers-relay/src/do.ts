@@ -7,6 +7,9 @@ const MAX_ACTIVE_RECIPIENTS = 50000;
 const MAX_TOTAL_QUEUED_BYTES = 512 * 1024 * 1024;
 const RECIPIENT_DECAY_MS = 7 * 86400 * 1000;
 const MAX_RELEASE_EVENT_AGE_MS = 90 * 86400 * 1000;
+const MESSAGE_DEDUPE_PREFIX = "message_dedupe:";
+const MESSAGE_DEDUPE_EXPIRY_PREFIX = "message_dedupe_expiry:";
+const MESSAGE_DEDUPE_GC_BATCH = 128;
 const MAGIC_MSG = new Uint8Array([0x4e, 0x42, 0x58, 0x4d, 0x53, 0x47, 0x01, 0x00]);
 function b64urlEncode(buf) {
     let s = "";
@@ -60,6 +63,41 @@ function releaseGroups(entries) {
     }
     return [...totals].map(([generation, bytes]) => ({ generation, bytes }));
 }
+function messageDedupeKey(senderFp, msgId) {
+    return MESSAGE_DEDUPE_PREFIX + b64urlEncode(senderFp) + ":" + b64urlEncode(msgId);
+}
+function messageDedupeExpiryKey(expiresAt, dedupeKey) {
+    return MESSAGE_DEDUPE_EXPIRY_PREFIX + String(expiresAt).padStart(16, "0") + ":" + dedupeKey;
+}
+function messageDedupeExpiryTime(expiryKey) {
+    const start = MESSAGE_DEDUPE_EXPIRY_PREFIX.length;
+    const separator = expiryKey.indexOf(":", start);
+    if (separator < 0)
+        return null;
+    const expiresAt = Number(expiryKey.slice(start, separator));
+    return Number.isSafeInteger(expiresAt) ? expiresAt : null;
+}
+async function pruneExpiredMessageDedupe(txn, now) {
+    const entries = await txn.list({ prefix: MESSAGE_DEDUPE_EXPIRY_PREFIX, limit: MESSAGE_DEDUPE_GC_BATCH });
+    for (const [expiryKey, dedupeKey] of entries) {
+        const expiresAt = messageDedupeExpiryTime(expiryKey);
+        if (expiresAt === null) {
+            await txn.delete(expiryKey);
+            continue;
+        }
+        if (expiresAt > now)
+            break;
+        const record = await txn.get(dedupeKey);
+        if (record && record.expires_at === expiresAt)
+            await txn.delete(dedupeKey);
+        await txn.delete(expiryKey);
+    }
+}
+async function nextMessageDedupeExpiry(txn) {
+    const entries = await txn.list({ prefix: MESSAGE_DEDUPE_EXPIRY_PREFIX, limit: 1 });
+    const firstKey = entries.keys().next().value;
+    return firstKey ? messageDedupeExpiryTime(firstKey) : null;
+}
 async function nextGenerationEpoch(txn) {
     const next = ((await txn.get("generation_epoch")) ?? 0) + 1;
     await txn.put("generation_epoch", next);
@@ -74,6 +112,9 @@ async function scheduleNextAlarm(txn, q, outbox, pending: { at: number } | null 
     for (const event of outbox)
         if (event.retry_at !== undefined)
             next = Math.min(next, event.retry_at);
+    const dedupeExpiry = await nextMessageDedupeExpiry(txn);
+    if (dedupeExpiry !== null)
+        next = Math.min(next, dedupeExpiry);
     if (Number.isFinite(next))
         await txn.setAlarm(Math.max(next, now + 1000));
     else
@@ -109,6 +150,7 @@ export class NbxFpDurableObject {
                 await txn.put("queue_generation", fallbackGeneration);
                 await txn.put("queue_generation_epoch", generationEpoch);
             }
+            await pruneExpiredMessageDedupe(txn, now);
             const expired = q.filter((e) => now - e.at >= TTL_MS);
             const live = q.filter((e) => now - e.at < TTL_MS);
             let outbox = ((await txn.get("release_outbox")) ?? [])
@@ -265,9 +307,29 @@ export class NbxFpDurableObject {
                 const currentEpoch = (await txn.get("queue_generation_epoch")) ?? 0;
                 const currentGeneration = await txn.get("queue_generation");
                 if (currentEpoch !== generationEpoch || currentGeneration !== generation)
-                    return false;
+                    return { ok: false, duplicate: false };
+                const now = Date.now();
+                const dedupeKey = messageDedupeKey(blob.slice(12, 20), blob.slice(28, 44));
+                const seen = await txn.get(dedupeKey);
+                if (seen && Number.isSafeInteger(seen.expires_at) && seen.expires_at > now) {
+                    const outbox = (await txn.get("release_outbox")) ?? [];
+                    outbox.push({ fp: [...blob.slice(20, 28)], generation, bytes: blob.length,
+                        release_id: crypto.randomUUID(), created_at: now, retry_at: now + 60_000 });
+                    await txn.put("release_outbox", outbox);
+                    const pending = await txn.get("pending");
+                    await scheduleNextAlarm(txn, (await txn.get("q")) ?? [], outbox, pending, now);
+                    return { ok: true, duplicate: true };
+                }
+                if (seen) {
+                    await txn.delete(dedupeKey);
+                    if (Number.isSafeInteger(seen.expires_at))
+                        await txn.delete(messageDedupeExpiryKey(seen.expires_at, dedupeKey));
+                }
+                const expiresAt = now + TTL_MS;
+                await txn.put(dedupeKey, { expires_at: expiresAt });
+                await txn.put(messageDedupeExpiryKey(expiresAt, dedupeKey), dedupeKey);
                 const q = (await txn.get("q")) ?? [];
-                q.push({ at: Date.now(), env: b64urlEncode(blob), generation });
+                q.push({ at: now, env: b64urlEncode(blob), generation });
                 const evicted = q.length > MAX_PER_FP ? q.slice(0, q.length - MAX_PER_FP) : [];
                 const trimmed = evicted.length ? q.slice(evicted.length) : q;
                 for (const e of evicted)
@@ -286,14 +348,15 @@ export class NbxFpDurableObject {
                 }
                 const outbox = (await txn.get("release_outbox")) ?? [];
                 const pending = await txn.get("pending");
-                await scheduleNextAlarm(txn, trimmed, outbox, pending);
-                return true;
+                await scheduleNextAlarm(txn, trimmed, outbox, pending, now);
+                return { ok: true, duplicate: false };
             });
-            if (!accepted)
+            if (!accepted.ok)
                 return json(409, { ok: false, error: "stale recipient generation" });
             await this.flushReleaseOutbox();
             const msgId = b64urlEncode(blob.slice(28, 44));
-            return json(202, { ok: true, msg_id: msgId, evicted_bytes: evictedBytes });
+            return json(202, { ok: true, msg_id: msgId, evicted_bytes: evictedBytes,
+                ...(accepted.duplicate ? { duplicate: true } : {}) });
         }
         if (req.method === "GET" && path === "/pop") {
             const generation = req.headers.get("x-recipient-generation");
