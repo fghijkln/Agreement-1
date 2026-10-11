@@ -112,6 +112,37 @@ def test_rollback_of_sealed_state_against_authenticated_anchor(tmp_path):
         da.load_session(cs2)
     print('R2-05 ok: 端到端拦截 (0,0) < (0,1)')
 
+
+@pytest.mark.parametrize('anchor_state', ['deleted', 'empty'])
+def test_rolled_back_sealed_session_requires_existing_authenticated_anchor(tmp_path, anchor_state):
+    da = Daemon(str(tmp_path / 'state-a'), 'https://relay.example')
+    peer_pub = fskey.Identity.generate().export_public()
+    cs = da.add_contact(peer_pub)
+    sess, _ = _established_pair()
+    cs.session = sess
+    sess.encrypt(b'older state')
+    da.save_session(cs)
+    old_blob = da._session_path(cs).read_bytes()
+    sess.encrypt(b'newer state')
+    da.save_session(cs)
+
+    da._session_path(cs).write_bytes(old_blob)
+    ep = da._epoch_log_path(cs.peer_fp)
+    if anchor_state == 'deleted':
+        ep.unlink()
+    else:
+        ep.write_bytes(b'')
+
+    da.contacts.clear()
+    cs2 = da.add_contact(peer_pub)
+    with pytest.raises(RuntimeError, match='session epoch anchor is (missing|empty)'):
+        da.load_session(cs2)
+    assert cs2.session is None
+    if anchor_state == 'deleted':
+        assert not ep.exists(), '加载失败不得重建被删除的锚'
+    else:
+        assert ep.read_bytes() == b'', '加载失败不得填充空锚'
+
 def test_r2_07_epoch_log_compaction(tmp_path):
     da = Daemon(str(tmp_path / 'state-a'), 'https://relay.example')
     peer_pub = fskey.Identity.generate().export_public()

@@ -209,17 +209,19 @@ class Daemon:
         state = storage.open_sealed(self._storage_key, raw, self._session_ctx(cs.peer_fp))
         rs = RatchetSession.import_state(state)
         ep = self._epoch_log_path(cs.peer_fp)
-        if ep.exists():
-            with open(ep) as f:
-                entries = self._parse_epoch_lines(f.read())
-            if not entries:
-                raise RuntimeError('session epoch log is empty; refusing to load unanchored state')
-            tags = [tag for _, tag in entries if tag is not None]
-            if tags and any(tag is None for _, tag in entries):
-                raise RuntimeError('session epoch log mixes legacy counters with authenticated anchors')
-            if tags and not hmac.compare_digest(tags[-1], self._session_epoch_tag(cs.peer_fp, state)):
-                raise RuntimeError(f'session state rollback detected for peer {_b64e(cs.peer_fp)}: epoch anchor mismatch')
-        self._write_session_epoch_anchor(cs.peer_fp, state)
+        if not ep.exists():
+            raise RuntimeError('session epoch anchor is missing; refusing to load sealed state')
+        with open(ep) as f:
+            entries = self._parse_epoch_lines(f.read())
+        if not entries:
+            raise RuntimeError('session epoch anchor is empty; refusing to load sealed state')
+        tags = [tag for _, tag in entries if tag is not None]
+        if not tags:
+            raise RuntimeError('session epoch log has no authenticated anchor; refusing to load sealed state')
+        if any(tag is None for _, tag in entries):
+            raise RuntimeError('session epoch log mixes legacy counters with authenticated anchors')
+        if not hmac.compare_digest(tags[-1], self._session_epoch_tag(cs.peer_fp, state)):
+            raise RuntimeError(f'session state rollback detected for peer {_b64e(cs.peer_fp)}: epoch anchor mismatch')
         cs.session = rs
 
     @staticmethod
