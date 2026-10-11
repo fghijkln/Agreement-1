@@ -64,18 +64,18 @@ describe("R2-15: 跨 DO 故障一致性", () => {
         const afterPush = await stats();
         expect(afterPush.total_bytes).toBe(before.total_bytes + 53);
         const regGet = env.NBX_REGISTRY.get.bind(env.NBX_REGISTRY);
-        const realStub = regGet(env.NBX_REGISTRY.idFromName("registry"));
-        const broken = new Proxy(realStub, {
-            get(target, prop) {
+        const registryId = env.NBX_REGISTRY.idFromName("registry");
+        const broken = new Proxy({}, {
+            get(_target, prop) {
                 if (prop === "fetch") {
                     return async (_url, init) => {
                         const u = String(_url);
                         if (u.includes("recipient_release"))
                             throw new Error("simulated cross-DO failure");
-                        return target.fetch(_url, init);
+                        return regGet(registryId).fetch(_url, init);
                     };
                 }
-                return target[prop];
+                return regGet(registryId)[prop];
             },
         });
         env.NBX_REGISTRY.get = () => broken;

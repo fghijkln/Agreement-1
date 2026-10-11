@@ -33,6 +33,21 @@ function concat(...arrs) {
     }
     return out;
 }
+function uuidBytes(uuid) {
+    const hex = uuid.replace(/-/g, "");
+    if (!/^[0-9a-f]{32}$/i.test(hex))
+        throw new Error("bad UUID");
+    return Uint8Array.from({ length: 16 }, (_, i) => parseInt(hex.slice(i * 2, i * 2 + 2), 16));
+}
+function releasePayload(fp, bytes, generation, releaseId, createdAt = Date.now()) {
+    const body = new Uint8Array(52);
+    body.set(fp, 0);
+    new DataView(body.buffer).setUint32(8, bytes, true);
+    body.set(uuidBytes(generation), 12);
+    body.set(uuidBytes(releaseId), 28);
+    new DataView(body.buffer).setBigUint64(44, BigInt(createdAt), true);
+    return body;
+}
 const MAGIC_MSG = new Uint8Array([0x4e, 0x42, 0x58, 0x4d, 0x53, 0x47, 0x01, 0x00]);
 const HEADER_SIZE = 48;
 function parseHeader(blob) {
@@ -180,39 +195,41 @@ export default {
                 const admitResp = await regStub.fetch("https://do/recipient_admit", {
                     method: "POST", body: admit,
                 });
+                const admitPayload = await admitResp.json();
                 if (!admitResp.ok) {
-                    const err = await admitResp.json();
-                    return json(429, { ok: false, error: err.error ?? "recipient admission denied" });
+                    return json(429, { ok: false, error: admitPayload.error ?? "recipient admission denied" });
                 }
-            }
-            const id = env.NBX_FP.idFromName(b64urlEncode(hdr.recvFp));
-            const stub = env.NBX_FP.get(id);
-            const resp = await stub.fetch("https://do/push", {
-                method: "POST", body: body.slice(0, envLen),
-            });
-            const pushPayload = await resp.json();
-            const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
-            if (resp.status === 202 && pushPayload.ok) {
-                const evicted = pushPayload.evicted_bytes ?? 0;
-                if (evicted > 0) {
-                    const rel = new Uint8Array(12);
-                    rel.set(hdr.recvFp, 0);
-                    new DataView(rel.buffer).setUint32(8, evicted, true);
-                    await regStub.fetch("https://do/recipient_release", {
-                        method: "POST", body: rel,
-                    });
-                }
-            }
-            else {
-                const rel = new Uint8Array(12);
-                rel.set(hdr.recvFp, 0);
-                new DataView(rel.buffer).setUint32(8, envLen, true);
-                await regStub.fetch("https://do/recipient_release", {
-                    method: "POST", body: rel,
+                if (!admitPayload.generation || !Number.isSafeInteger(admitPayload.generation_epoch)
+                    || admitPayload.generation_epoch < 1)
+                    return json(503, { ok: false, error: "recipient generation unavailable" });
+                const id = env.NBX_FP.idFromName(b64urlEncode(hdr.recvFp));
+                const stub = env.NBX_FP.get(id);
+                const resp = await stub.fetch("https://do/push", {
+                    method: "POST",
+                    headers: {
+                        "x-recipient-generation": admitPayload.generation,
+                        "x-recipient-generation-epoch": String(admitPayload.generation_epoch),
+                        "x-recipient-reset": String(admitPayload.reset_generation === true),
+                    },
+                    body: body.slice(0, envLen),
                 });
-                return json(400, { ok: false, error: "enqueue failed" });
+                const pushPayload = await resp.json();
+                if (resp.status !== 202 || !pushPayload.ok) {
+                    const releaseId = crypto.randomUUID();
+                    const rel = releasePayload(hdr.recvFp, envLen, admitPayload.generation, releaseId);
+                    let released = false;
+                    for (let attempt = 0; attempt < 3 && !released; attempt++) {
+                        try {
+                            released = (await regStub.fetch("https://do/recipient_release", {
+                                method: "POST", body: rel,
+                            })).ok;
+                        }
+                        catch { }
+                    }
+                    return json(400, { ok: false, error: "enqueue failed" });
+                }
+                return json(202, pushPayload);
             }
-            return json(202, pushPayload);
         }
         if (req.method === "POST" && url.pathname.startsWith("/inbox/")) {
             const fpB64 = url.pathname.slice("/inbox/".length);
@@ -236,8 +253,26 @@ export default {
                 return json(403, { ok: false, error: "unauthorized" });
             const id = env.NBX_FP.idFromName(fpB64);
             const stub = env.NBX_FP.get(id);
-            const resp = await stub.fetch("https://do/pop");
+            const regStub = env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"));
+            const generationResp = await regStub.fetch("https://do/recipient_generation", {
+                method: "POST", body: fp,
+            });
+            if (!generationResp.ok)
+                return json(503, { ok: false, error: "recipient generation unavailable" });
+            const generationPayload = await generationResp.json();
+            if (generationPayload.generation
+                && (!Number.isSafeInteger(generationPayload.generation_epoch) || generationPayload.generation_epoch < 1))
+                return json(503, { ok: false, error: "recipient generation unavailable" });
+            const popHeaders = generationPayload.generation
+                ? {
+                    "x-recipient-generation": generationPayload.generation,
+                    "x-recipient-generation-epoch": String(generationPayload.generation_epoch),
+                    "x-recipient-reset": String(generationPayload.reset_generation === true),
+                } : undefined;
+            const resp = await stub.fetch("https://do/pop", { headers: popHeaders });
             const payload = await resp.json();
+            if (!resp.ok)
+                return json(resp.status, payload);
             if (payload.popped_bytes === undefined && payload.envelopes) {
                 let freed = 0;
                 for (const e of payload.envelopes)
@@ -245,27 +280,30 @@ export default {
                 payload.popped_bytes = freed;
             }
             if ((payload.popped_bytes ?? 0) > 0) {
-                const rel = new Uint8Array(28);
-                rel.set(fp, 0);
-                new DataView(rel.buffer).setUint32(8, payload.popped_bytes, true);
-                if (payload.release_id) {
-                    const rid = payload.release_id.replace(/-/g, "");
-                    for (let i = 0; i < 16; i++)
-                        rel[12 + i] = parseInt(rid.slice(i * 2, i * 2 + 2), 16);
+                const releaseId = payload.release_id ?? crypto.randomUUID();
+                let releaseEvents = Array.isArray(payload.release_events) ? payload.release_events : null;
+                if (releaseEvents === null) {
+                    releaseEvents = generationPayload.generation
+                        ? [{ generation: generationPayload.generation, bytes: payload.popped_bytes }] : [];
                 }
-                let released = false;
-                for (let attempt = 0; attempt < 3 && !released; attempt++) {
-                    try {
-                        const rr = await env.NBX_REGISTRY.get(env.NBX_REGISTRY.idFromName("registry"))
-                            .fetch("https://do/recipient_release", { method: "POST", body: rel });
-                        released = rr.ok;
+                for (const event of releaseEvents) {
+                    if (!event.generation || event.bytes <= 0)
+                        continue;
+                    const rel = releasePayload(fp, event.bytes, event.generation, releaseId,
+                        payload.release_at ?? Date.now());
+                    let released = false;
+                    for (let attempt = 0; attempt < 3 && !released; attempt++) {
+                        try {
+                            const rr = await regStub.fetch("https://do/recipient_release", { method: "POST", body: rel });
+                            released = rr.ok;
+                        }
+                        catch { }
                     }
-                    catch { }
+                    if (!released)
+                        return json(503, { ok: false, error: "release unavailable, retry" });
                 }
-                if (!released)
-                    return json(503, { ok: false, error: "release unavailable, retry" });
                 if (payload.release_id) {
-                    const ackBytes = new Uint8Array(16).map((_, i) => rel[12 + i]);
+                    const ackBytes = uuidBytes(payload.release_id);
                     await stub.fetch("https://do/pop_ack", {
                         method: "POST", body: ackBytes,
                     });
